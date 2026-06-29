@@ -244,9 +244,8 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     await done
 
 
-async def run():
-    print(f"Connecting to {SIGNALING_URL} (room={ROOM}) ...")
-    async with websockets.connect(SIGNALING_URL, max_size=None) as ws:
+async def connect_once():
+    async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
         await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM}))
         print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
 
@@ -300,6 +299,23 @@ async def run():
                 if pc:
                     await pc.close()
                     pc = None
+
+
+async def run():
+    # Reconnect loop: Render's free tier sleeps when idle and returns 404 until
+    # it wakes (~50s), so the first connection often fails. Keep retrying; this
+    # also recovers automatically if the signaling server restarts.
+    print(f"Connecting to {SIGNALING_URL} (room={ROOM}) ...")
+    print("(If the signaling server is asleep, the first attempt can take up to a minute.)")
+    while True:
+        try:
+            await connect_once()
+            print("signaling connection closed; reconnecting in 3s...")
+        except (OSError, websockets.exceptions.WebSocketException) as e:
+            print(f"could not reach signaling server ({e}); retrying in 5s...")
+            await asyncio.sleep(5)
+            continue
+        await asyncio.sleep(3)
 
 
 def main():
