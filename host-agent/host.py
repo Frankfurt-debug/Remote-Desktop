@@ -186,34 +186,46 @@ def _grab(monitor_index: int):
 
 
 class ScreenTrack(VideoStreamTrack):
-    """A WebRTC video track that yields frames grabbed from the screen."""
+    """A WebRTC video track that yields frames grabbed from the screen.
+
+    fps, scale and show_cursor are public and can be changed live (the viewer
+    sends a {"type": "config", ...} message over the data channel)."""
 
     def __init__(self, monitor_index: int = 1, fps: int = 30):
         super().__init__()
         self._monitor = monitor_index
-        self._fps = fps
+        self.fps = fps
+        self.scale = 1.0          # 0.25 .. 1.0 — downscale for less bandwidth
+        self.show_cursor = True
         self._start = None
         self._timestamp = 0
-        # Single dedicated worker so screen grabs don't block the event loop.
-        self._executor = None
 
     async def recv(self) -> VideoFrame:
         loop = asyncio.get_event_loop()
+        fps = max(1, min(60, int(self.fps)))
 
         # Pace frames to the target FPS.
         if self._start is None:
             self._start = time.time()
             self._timestamp = 0
         else:
-            self._timestamp += int(VIDEO_CLOCK_RATE / self._fps)
+            self._timestamp += int(VIDEO_CLOCK_RATE / fps)
             target = self._start + self._timestamp / VIDEO_CLOCK_RATE
             delay = target - time.time()
             if delay > 0:
                 await asyncio.sleep(delay)
 
         arr, mon_left, mon_top = await loop.run_in_executor(None, _grab, self._monitor)
-        draw_cursor(arr, mon_left, mon_top)
+        if self.show_cursor:
+            draw_cursor(arr, mon_left, mon_top)
+
         frame = VideoFrame.from_ndarray(arr, format="rgb24")
+        if self.scale < 0.999:
+            h, w, _ = arr.shape
+            nw = max(2, int(w * self.scale)) & ~1   # even dims for YUV420
+            nh = max(2, int(h * self.scale)) & ~1
+            frame = frame.reformat(width=nw, height=nh)
+
         frame.pts = self._timestamp
         frame.time_base = fractions.Fraction(1, VIDEO_CLOCK_RATE)
         return frame
@@ -323,16 +335,30 @@ async def connect_once():
             if pc is not None:
                 await pc.close()
             pc = RTCPeerConnection(RTCConfiguration(iceServers=build_ice_servers()))
-            pc.addTrack(ScreenTrack(MONITOR, FPS))
+            track = ScreenTrack(MONITOR, FPS)
+            pc.addTrack(track)
 
             channel = pc.createDataChannel("input")
 
             @channel.on("message")
             def on_message(data):
                 try:
-                    handle_input(json.loads(data))
+                    msg = json.loads(data)
                 except Exception as e:
-                    print("bad input message:", e)
+                    print("bad message:", e)
+                    return
+                # Viewer settings (FPS / quality / cursor) arrive as "config";
+                # everything else is mouse/keyboard input.
+                if msg.get("type") == "config":
+                    if "fps" in msg:
+                        track.fps = int(msg["fps"])
+                    if "scale" in msg:
+                        track.scale = float(msg["scale"])
+                    if "cursor" in msg:
+                        track.show_cursor = bool(msg["cursor"])
+                    print(f"config: fps={track.fps} scale={track.scale} cursor={track.show_cursor}")
+                else:
+                    handle_input(msg)
 
             @pc.on("connectionstatechange")
             async def on_state():

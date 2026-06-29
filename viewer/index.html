@@ -5,226 +5,360 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Remote Desktop</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
-  #stage { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; }
-  video { max-width: 100%; max-height: 100%; display: block; background: #000; cursor: none; }
-  #overlay {
-    position: fixed; inset: 0; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 14px;
-    color: #ddd; background: rgba(0,0,0,.85); z-index: 10; text-align: center;
-  }
-  #overlay.hidden { display: none; }
-  #overlay h1 { font-size: 20px; font-weight: 600; margin: 0; }
-  #overlay button {
-    padding: 12px 22px; font-size: 16px; border: 0; border-radius: 8px;
-    background: #2d7dff; color: #fff; cursor: pointer;
-  }
-  #overlay input { padding: 8px; border-radius: 6px; border: 1px solid #444; background:#111; color:#eee; width: 320px; }
-  #status { position: fixed; top: 8px; left: 8px; color: #6f6; font-size: 12px; z-index: 5; opacity:.7; pointer-events:none; }
-  .row { display:flex; gap:8px; align-items:center; }
-  label { font-size: 13px; color:#aaa; }
+  :root { --accent:#2d7dff; --bg:#0c0c0e; --panel:#16161a; --line:#2a2a32; --txt:#e8e8ea; --dim:#9a9aa4; }
+  html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:system-ui, sans-serif; color:var(--txt); }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  video { max-width:100%; max-height:100%; display:block; background:#000; }
+  video.fill { width:100%; height:100%; object-fit:fill; }
+  video.contain { width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; }
+
+  /* While streaming, hide the local cursor so only the host-drawn one shows
+     (fixes seeing two cursors / the mouse over a fullscreen game). Buttons
+     re-enable a pointer so the toolbar stays usable. */
+  body.nocursor, body.nocursor video, body.nocursor #stage { cursor:none; }
+  body.nocursor .ui { cursor:pointer; }
+
+  /* Toolbar (top-left) */
+  #toolbar { position:fixed; top:10px; left:10px; z-index:6; display:none; gap:6px; }
+  body.streaming #toolbar { display:flex; }
+  .ui { background:rgba(20,20,26,.72); color:var(--txt); border:1px solid var(--line);
+        border-radius:8px; padding:7px 11px; font-size:13px; cursor:pointer; backdrop-filter:blur(4px); }
+  .ui:hover { background:rgba(40,40,52,.9); }
+
+  /* Stats HUD (top-right) */
+  #hud { position:fixed; top:10px; right:10px; z-index:6; display:none;
+         background:rgba(10,10,14,.66); border:1px solid var(--line); border-radius:8px;
+         padding:8px 10px; font:12px/1.5 ui-monospace, Menlo, Consolas, monospace; color:#bfe;
+         backdrop-filter:blur(4px); pointer-events:none; min-width:128px; }
+  #hud b { color:#fff; }
+  #hud .lock { color:#ffd479; }
+
+  /* Settings / connect overlay */
+  #overlay { position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
+             background:rgba(0,0,0,.82); backdrop-filter:blur(3px); overflow:auto; }
+  #overlay.hidden { display:none; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px 24px;
+           width:380px; max-width:92vw; box-shadow:0 16px 50px rgba(0,0,0,.5); }
+  .panel h1 { font-size:19px; margin:0 0 4px; }
+  .panel .sub { color:var(--dim); font-size:13px; margin:0 0 16px; }
+  .grp { border-top:1px solid var(--line); padding:13px 0 4px; }
+  .grp h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }
+  .field { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:9px 0; }
+  .field label { font-size:13px; color:#d6d6da; }
+  .field .val { font-size:12px; color:var(--dim); min-width:42px; text-align:right; }
+  input[type=text] { width:100%; box-sizing:border-box; padding:9px 10px; border-radius:8px;
+                     border:1px solid var(--line); background:#0e0e12; color:var(--txt); font-size:13px; }
+  input[type=range] { width:150px; accent-color:var(--accent); }
+  select { background:#0e0e12; color:var(--txt); border:1px solid var(--line); border-radius:7px; padding:6px 8px; font-size:13px; }
+  input[type=checkbox] { width:17px; height:17px; accent-color:var(--accent); }
+  .full { display:block; margin:4px 0 2px; }
+  .btn { width:100%; margin-top:18px; padding:12px; border:0; border-radius:9px; background:var(--accent);
+         color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
+  .btn:hover { filter:brightness(1.08); }
+  .btn.sec { background:#2a2a32; margin-top:8px; }
+  #status { position:fixed; bottom:8px; left:10px; color:#6f6; font-size:12px; z-index:5; opacity:.7; pointer-events:none; }
+  .hint { font-size:12px; color:var(--dim); margin-top:14px; line-height:1.5; }
 </style>
 </head>
 <body>
   <div id="stage"><video id="video" autoplay playsinline></video></div>
+
+  <div id="toolbar">
+    <button class="ui" id="btnSettings">⚙ Settings</button>
+    <button class="ui" id="btnFull">⛶ Fullscreen</button>
+    <button class="ui" id="btnLock">🖱 Capture mouse</button>
+  </div>
+
+  <div id="hud"></div>
   <div id="status"></div>
 
   <div id="overlay">
-    <h1>Remote Desktop Viewer</h1>
-    <div class="row"><label>Signaling</label><input id="server" /></div>
-    <div class="row"><label>Room</label><input id="room" style="width:120px" /></div>
-    <button id="connectBtn">Connect</button>
-    <div id="hint" style="font-size:13px;color:#888;max-width:380px">
-      After the video appears, click it to capture the mouse (Pointer Lock).
-      Press <b>Esc</b> to release. Double-press <b>Esc</b> isn't needed — your
-      keystrokes are forwarded to the remote PC while locked.
+    <div class="panel">
+      <h1>Remote Desktop</h1>
+      <p class="sub" id="panelSub">Configure, then connect.</p>
+
+      <div class="grp" style="border-top:0; padding-top:0">
+        <h2>Connection</h2>
+        <label class="full" style="font-size:13px;color:#d6d6da">Signaling server</label>
+        <input type="text" id="server" />
+        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:8px">Room</label>
+        <input type="text" id="room" />
+      </div>
+
+      <div class="grp">
+        <h2>Video</h2>
+        <div class="field"><label for="fps">Frame rate</label>
+          <input type="range" id="fps" min="10" max="60" step="5"><span class="val" id="fpsV"></span></div>
+        <div class="field"><label for="scale">Quality (resolution)</label>
+          <select id="scale">
+            <option value="1">100% (sharpest)</option>
+            <option value="0.75">75%</option>
+            <option value="0.5">50% (smoother)</option>
+            <option value="0.25">25% (lowest)</option>
+          </select></div>
+        <div class="field"><label for="fit">Fit to window</label>
+          <select id="fit">
+            <option value="contain">Keep aspect (letterbox)</option>
+            <option value="fill">Stretch to fill</option>
+          </select></div>
+      </div>
+
+      <div class="grp">
+        <h2>Mouse</h2>
+        <div class="field"><label for="lock">Capture mouse on click (gaming)</label><input type="checkbox" id="lock"></div>
+        <div class="field"><label for="sens">Sensitivity</label>
+          <input type="range" id="sens" min="0.2" max="3" step="0.1"><span class="val" id="sensV"></span></div>
+        <div class="field"><label for="smooth">Smooth movement</label><input type="checkbox" id="smooth"></div>
+        <div class="field"><label for="cursor">Show cursor on screen</label><input type="checkbox" id="cursor"></div>
+      </div>
+
+      <div class="grp">
+        <h2>Overlay</h2>
+        <div class="field"><label for="hudOn">Show stats (FPS / latency)</label><input type="checkbox" id="hudOn"></div>
+      </div>
+
+      <button class="btn" id="connectBtn">Connect</button>
+      <button class="btn sec" id="doneBtn" style="display:none">Resume</button>
+      <div class="hint" id="hint">After connecting, click the screen (or “Capture mouse”) to play games with Pointer Lock. Press <b>Esc</b> to release and reopen this panel.</div>
     </div>
   </div>
 
 <script>
+const BAKED_URL = "wss://remote-desktop-signaling.onrender.com";   // <-- your Render server
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
-const video = $("video");
-const overlay = $("overlay");
-const statusEl = $("status");
+const video = $("video"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status");
 
-// When this page is served by the signaling server itself (e.g. from Render
-// over https), the signaling endpoint is the same origin: wss://<host>.
-// Falls back to ws://localhost:8080 when opened as a local file during dev.
+// ---- Settings (persisted) -------------------------------------------------
 const sameOrigin = location.host
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host
-  : "ws://localhost:8080";
-$("server").value = qs.get("server") || sameOrigin;
-$("room").value = qs.get("room") || "default";
+  : BAKED_URL;
+const DEFAULTS = {
+  server: sameOrigin || BAKED_URL, room: "default",
+  fps: 30, scale: 1, fit: "contain",
+  lock: true, sens: 1, smooth: true, cursor: true, hud: true,
+};
+let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
+// URL overrides
+if (qs.get("server")) S.server = qs.get("server");
+if (qs.get("room")) S.room = qs.get("room");
+if (qs.get("sens")) S.sens = parseFloat(qs.get("sens"));
+function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S)); }
 
-const ICE = [{ urls: ["stun:stun.l.google.com:19302"] }];
-// To add TURN, append e.g.:
-// ICE.push({ urls: "turn:turn.example.com:3478", username: "user", credential: "pass" });
+// Bind form <-> S
+function formToS() {
+  S.server = $("server").value.trim() || BAKED_URL;
+  S.room = $("room").value.trim() || "default";
+  S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
+  S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
+  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked;
+}
+function sToForm() {
+  $("server").value = S.server; $("room").value = S.room;
+  $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
+  $("scale").value = String(S.scale); $("fit").value = S.fit;
+  $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
+  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud;
+}
+$("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
+$("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
+sToForm();
 
-let ws, pc, inputChannel;
+// ---- Connection state -----------------------------------------------------
+let ws, pc, inputChannel, connected = false, settingsOpen = true;
 
 function setStatus(s) { statusEl.textContent = s; }
-
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-function sendInput(obj) { if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(obj)); }
-
-$("connectBtn").onclick = connect;
-
-function connect() {
-  const url = $("server").value.trim();
-  const room = $("room").value.trim() || "default";
-  setStatus("connecting...");
-  ws = new WebSocket(url);
-
-  ws.onopen = () => {
-    send({ type: "register", role: "viewer", room });
-    setStatus("waiting for host...");
-  };
-
-  ws.onmessage = async (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "offer") {
-      await handleOffer(msg);
-    } else if (msg.type === "host-ready") {
-      setStatus("host ready, negotiating...");
-    } else if (msg.type === "peer-left") {
-      setStatus("host disconnected");
-      teardown();
-    }
-  };
-
-  ws.onclose = () => setStatus("signaling closed");
-  ws.onerror = () => setStatus("signaling error");
+function wsSend(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function sendInput(o) { if (inputChannel && inputChannel.readyState === "open" && !settingsOpen) inputChannel.send(JSON.stringify(o)); }
+function sendConfig() {
+  if (inputChannel && inputChannel.readyState === "open")
+    inputChannel.send(JSON.stringify({ type: "config", fps: S.fps, scale: S.scale, cursor: S.cursor }));
 }
 
-async function handleOffer(msg) {
+function applyVideoStyle() {
+  video.className = S.fit;          // 'contain' or 'fill'
+}
+function updateCursorHide() {
+  document.body.classList.toggle("nocursor", connected && !settingsOpen);
+}
+
+// ---- Settings panel open/close --------------------------------------------
+function openSettings() {
+  settingsOpen = true;
+  if (document.pointerLockElement) document.exitPointerLock();
+  $("connectBtn").style.display = connected ? "none" : "block";
+  $("doneBtn").style.display = connected ? "block" : "none";
+  $("panelSub").textContent = connected ? "Adjust settings live." : "Configure, then connect.";
+  sToForm();
+  overlay.classList.remove("hidden");
+  updateCursorHide();
+}
+function closeSettings() {
+  formToS(); saveSettings();
+  applyVideoStyle();
+  sendConfig();
+  hud.style.display = S.hud ? "block" : "none";
+  overlay.classList.add("hidden");
+  settingsOpen = false;
+  updateCursorHide();
+}
+
+$("btnSettings").onclick = openSettings;
+$("doneBtn").onclick = closeSettings;
+$("connectBtn").onclick = () => { formToS(); saveSettings(); connect(); };
+$("btnFull").onclick = toggleFullscreen;
+$("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
+
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen().catch(() => {});
+}
+
+// ---- WebRTC / signaling ---------------------------------------------------
+const ICE = [{ urls: ["stun:stun.l.google.com:19302"] }];
+// To use a TURN relay (needed only behind symmetric NAT), add e.g.:
+// ICE.push({ urls: "turn:turn.example.com:3478", username: "user", credential: "pass" });
+
+function connect() {
+  setStatus("connecting…");
+  ws = new WebSocket(S.server);
+  ws.onopen = () => { wsSend({ type: "register", role: "viewer", room: S.room }); setStatus("waiting for host… (free server can take ~50s to wake)"); };
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === "offer") await handleOffer(m);
+    else if (m.type === "host-ready") setStatus("host ready, negotiating…");
+    else if (m.type === "peer-left") { setStatus("host disconnected"); teardown(); }
+  };
+  ws.onclose = () => setStatus("signaling closed");
+  ws.onerror = () => setStatus("signaling error — is the server URL right?");
+}
+
+async function handleOffer(m) {
   setStatus("offer received");
   pc = new RTCPeerConnection({ iceServers: ICE });
-
   pc.ontrack = (e) => {
     video.srcObject = e.streams[0];
-    overlay.classList.add("hidden");
-    setStatus("streaming — click to capture mouse");
+    connected = true;
+    document.body.classList.add("streaming");
+    applyVideoStyle();
+    closeSettings();                 // hide panel, push current config to host
+    setStatus("");
   };
-
-  // The host creates the "input" data channel; we receive it here.
   pc.ondatachannel = (e) => {
     inputChannel = e.channel;
-    inputChannel.onopen = () => setStatus("input channel open");
+    inputChannel.onopen = () => sendConfig();
   };
-
   pc.onconnectionstatechange = () => {
-    setStatus("peer: " + pc.connectionState);
-    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") teardown();
+    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) { setStatus("connection lost"); teardown(); }
   };
-
-  await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+  await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
-  await waitIceComplete(pc);          // non-trickle: send full SDP with candidates
-  send({ type: "answer", sdp: pc.localDescription.sdp });
+  await waitIceComplete(pc);
+  wsSend({ type: "answer", sdp: pc.localDescription.sdp });
 }
 
 function waitIceComplete(pc) {
   if (pc.iceGatheringState === "complete") return Promise.resolve();
-  return new Promise((resolve) => {
-    const check = () => {
-      if (pc.iceGatheringState === "complete") {
-        pc.removeEventListener("icegatheringstatechange", check);
-        resolve();
-      }
-    };
-    pc.addEventListener("icegatheringstatechange", check);
+  return new Promise((res) => {
+    const f = () => { if (pc.iceGatheringState === "complete") { pc.removeEventListener("icegatheringstatechange", f); res(); } };
+    pc.addEventListener("icegatheringstatechange", f);
   });
 }
 
 function teardown() {
   if (pc) { try { pc.close(); } catch {} pc = null; }
-  inputChannel = null;
+  inputChannel = null; connected = false;
   video.srcObject = null;
-  overlay.classList.remove("hidden");
+  document.body.classList.remove("streaming");
+  hud.style.display = "none";
+  openSettings();
 }
 
-// ---------------------------------------------------------------------------
-// Input capture
-// ---------------------------------------------------------------------------
+// ---- Input capture --------------------------------------------------------
 const locked = () => document.pointerLockElement === video;
 
-video.addEventListener("click", () => {
-  if (!locked()) video.requestPointerLock();
-});
+video.addEventListener("click", () => { if (S.lock && !locked() && !settingsOpen) video.requestPointerLock(); });
 
-// Mouse movement is coalesced and flushed once per animation frame (~60 Hz).
-// A raw mousemove can fire hundreds of times a second; sending each one floods
-// the data channel and makes motion feel laggy/jerky. Accumulating relative
-// deltas (and keeping only the latest absolute position) gives smooth motion
-// with a fraction of the messages.
-const SENS = parseFloat(qs.get("sens")) || 1;   // mouse sensitivity multiplier
 let accDx = 0, accDy = 0, pendingAbs = null;
-
 document.addEventListener("mousemove", (e) => {
-  if (!inputChannel) return;
+  if (!inputChannel || settingsOpen) return;
   if (locked()) {
-    accDx += e.movementX;
-    accDy += e.movementY;
+    if (S.smooth) { accDx += e.movementX; accDy += e.movementY; }
+    else sendInput({ type: "mousemoverel", dx: Math.round(e.movementX * S.sens), dy: Math.round(e.movementY * S.sens) });
   } else {
     const r = video.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) return;
-    const x = (e.clientX - r.left) / r.width;
-    const y = (e.clientY - r.top) / r.height;
-    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) pendingAbs = { x, y };
+    if (!r.width || !r.height) return;
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
+      if (S.smooth) pendingAbs = { x, y };
+      else sendInput({ type: "mousemove", x, y });
+    }
   }
 });
-
 function flushMouse() {
-  if (inputChannel && inputChannel.readyState === "open") {
+  if (inputChannel && inputChannel.readyState === "open" && !settingsOpen) {
     if (locked()) {
-      if (accDx !== 0 || accDy !== 0) {
-        sendInput({ type: "mousemoverel", dx: Math.round(accDx * SENS), dy: Math.round(accDy * SENS) });
-        accDx = 0; accDy = 0;
-      }
-    } else if (pendingAbs) {
-      sendInput({ type: "mousemove", x: pendingAbs.x, y: pendingAbs.y });
-      pendingAbs = null;
-    }
+      if (accDx || accDy) { sendInput({ type: "mousemoverel", dx: Math.round(accDx * S.sens), dy: Math.round(accDy * S.sens) }); accDx = accDy = 0; }
+    } else if (pendingAbs) { sendInput({ type: "mousemove", x: pendingAbs.x, y: pendingAbs.y }); pendingAbs = null; }
   }
   requestAnimationFrame(flushMouse);
 }
 requestAnimationFrame(flushMouse);
 
-document.addEventListener("mousedown", (e) => {
-  if (!inputChannel || video.srcObject === null) return;
-  sendInput({ type: "mousedown", button: e.button });
-});
-document.addEventListener("mouseup", (e) => {
-  if (!inputChannel || video.srcObject === null) return;
-  sendInput({ type: "mouseup", button: e.button });
-});
-
+document.addEventListener("mousedown", (e) => { if (connected && !settingsOpen) sendInput({ type: "mousedown", button: e.button }); });
+document.addEventListener("mouseup",   (e) => { if (connected && !settingsOpen) sendInput({ type: "mouseup", button: e.button }); });
 document.addEventListener("wheel", (e) => {
-  if (!inputChannel) return;
-  if (video.srcObject) e.preventDefault();
-  sendInput({ type: "wheel", dy: e.deltaY });
+  if (!connected || settingsOpen) return;
+  e.preventDefault(); sendInput({ type: "wheel", dy: e.deltaY });
 }, { passive: false });
-
-// Block the context menu so right-click reaches the remote.
-document.addEventListener("contextmenu", (e) => { if (video.srcObject) e.preventDefault(); });
+document.addEventListener("contextmenu", (e) => { if (connected) e.preventDefault(); });
 
 document.addEventListener("keydown", (e) => {
-  if (!inputChannel || !video.srcObject) return;
-  // Let the user escape pointer lock with Esc instead of forwarding it.
-  if (e.key === "Escape" && locked()) return;
+  if (!connected) return;
+  if (e.key === "Escape") {            // Esc: release lock, then open settings
+    if (locked()) return;              // (browser exits lock first; next press opens panel)
+    if (!settingsOpen) { openSettings(); e.preventDefault(); return; }
+  }
+  if (settingsOpen) return;
   e.preventDefault();
   sendInput({ type: "keydown", code: e.code, key: e.key });
 });
 document.addEventListener("keyup", (e) => {
-  if (!inputChannel || !video.srcObject) return;
-  if (e.key === "Escape" && !locked()) { /* still forward when not locked */ }
+  if (!connected || settingsOpen) return;
   e.preventDefault();
   sendInput({ type: "keyup", code: e.code, key: e.key });
 });
 
-// Auto-connect if a server was provided in the URL.
-if (qs.get("autoconnect") === "1") connect();
+// ---- Stats HUD ------------------------------------------------------------
+let lastBytes = 0, lastTs = 0;
+async function pollStats() {
+  if (pc && S.hud && connected) {
+    try {
+      const stats = await pc.getStats();
+      let fps = "–", w = 0, h = 0, rtt = null, bytes = 0, ts = 0;
+      stats.forEach((r) => {
+        if (r.type === "inbound-rtp" && r.kind === "video") {
+          if (r.framesPerSecond != null) fps = Math.round(r.framesPerSecond);
+          w = r.frameWidth || w; h = r.frameHeight || h; bytes = r.bytesReceived || 0; ts = r.timestamp || 0;
+        }
+        if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime != null) rtt = r.currentRoundTripTime;
+      });
+      let kbps = 0;
+      if (lastTs && ts > lastTs) kbps = Math.round((bytes - lastBytes) * 8 / (ts - lastTs));
+      lastBytes = bytes; lastTs = ts;
+      const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
+      hud.innerHTML =
+        `FPS <b>${fps}</b><br>Ping <b>${ping}</b><br>` +
+        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b>` +
+        (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
+    } catch {}
+  }
+}
+setInterval(pollStats, 1000);
+
+// ---- Boot -----------------------------------------------------------------
+openSettings();
+if (qs.get("autoconnect") === "1") { formToS(); saveSettings(); connect(); }
 </script>
 </body>
 </html>
