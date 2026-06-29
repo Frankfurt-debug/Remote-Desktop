@@ -357,6 +357,24 @@ def build_ice_servers():
     return servers
 
 
+def cap_video_bitrate(sdp: str, kbps: int) -> str:
+    """Insert a `b=AS:<kbps>` bandwidth line into the video media section.
+
+    aiortc honours the bandwidth in the *remote* description as the cap for its
+    encoder, so applying this to the browser's answer keeps the stream from
+    saturating the link (which is what made it freeze then fail)."""
+    out, in_video, inserted = [], False, False
+    for line in sdp.replace("\r\n", "\n").split("\n"):
+        if line.startswith("m="):
+            in_video = line.startswith("m=video")
+        out.append(line)
+        if in_video and line.startswith("c=") and not inserted:
+            out.append(f"b=AS:{kbps}")
+            out.append(f"b=TIAS:{kbps * 1000}")
+            inserted = True
+    return "\r\n".join(out)
+
+
 async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
@@ -383,7 +401,7 @@ async def connect_once():
                 await pc.close()
             pc = RTCPeerConnection(RTCConfiguration(iceServers=build_ice_servers()))
             track = ScreenTrack(MONITOR, FPS)
-            sender = pc.addTrack(track)
+            pc.addTrack(track)
 
             channel = pc.createDataChannel("input")
 
@@ -412,18 +430,6 @@ async def connect_once():
                 print("connection state:", pc.connectionState)
 
             await pc.setLocalDescription(await pc.createOffer())
-
-            # Cap the encoder bitrate now that the encoding params exist, so it
-            # can't saturate the link and trigger the freeze-then-fail spiral.
-            try:
-                params = sender.getParameters()
-                if params.encodings:
-                    params.encodings[0].maxBitrate = MAX_BITRATE
-                    await sender.setParameters(params)
-                    print(f"max bitrate capped at {MAX_BITRATE // 1000} kbps")
-            except Exception as e:
-                print("could not set bitrate cap:", e)
-
             await wait_ice_gathering_complete(pc)
             await ws.send(json.dumps({
                 "type": "offer",
@@ -441,10 +447,11 @@ async def connect_once():
 
             elif mtype == "answer":
                 if pc:
+                    sdp = cap_video_bitrate(msg["sdp"], MAX_BITRATE // 1000)
                     await pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=msg["sdp"], type="answer")
+                        RTCSessionDescription(sdp=sdp, type="answer")
                     )
-                    print("answer applied")
+                    print(f"answer applied (bitrate capped at {MAX_BITRATE // 1000} kbps)")
 
             elif mtype == "peer-left":
                 print("viewer left")
