@@ -11,13 +11,26 @@
 // answers Upgrade requests and would be marked unhealthy and cycled).
 
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 8080;
 
+// The viewer is a sibling folder in the repo; serving it here means one URL
+// does everything (open it in a browser; it also satisfies the health check).
+const VIEWER = path.join(__dirname, "..", "viewer", "index.html");
+
 const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("signaling server ok");
+  fs.readFile(VIEWER, (err, data) => {
+    if (err) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("signaling server ok");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(data);
+  });
 });
 
 const wss = new WebSocketServer({ server: httpServer });

@@ -48,7 +48,13 @@ const video = $("video");
 const overlay = $("overlay");
 const statusEl = $("status");
 
-$("server").value = qs.get("server") || `ws://${location.hostname || "localhost"}:8080`;
+// When this page is served by the signaling server itself (e.g. from Render
+// over https), the signaling endpoint is the same origin: wss://<host>.
+// Falls back to ws://localhost:8080 when opened as a local file during dev.
+const sameOrigin = location.host
+  ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host
+  : "ws://localhost:8080";
+$("server").value = qs.get("server") || sameOrigin;
 $("room").value = qs.get("room") || "default";
 
 const ICE = [{ urls: ["stun:stun.l.google.com:19302"] }];
