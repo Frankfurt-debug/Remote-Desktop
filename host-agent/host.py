@@ -54,6 +54,10 @@ SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
 ROOM = os.environ.get("ROOM", "default")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
+# Cap the encoder so it can't try to send more than the link (or a school
+# network's relay) can carry — an uncapped bitrate is what saturates the
+# connection and makes it freeze then fail. ~5 Mbps suits 720p-ish streaming.
+MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "5000000"))
 
 TURN_URL = os.environ.get("TURN_URL")           # e.g. turn:turn.example.com:3478
 TURN_USER = os.environ.get("TURN_USER")
@@ -334,7 +338,22 @@ def handle_input(msg: dict) -> None:
 def build_ice_servers():
     servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
     if TURN_URL:
+        # Your own TURN server (most reliable). Set TURN_URL/USER/PASS.
         servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
+    else:
+        # Free public TURN relay (best-effort) so restrictive networks that block
+        # the direct UDP path — like school/guest Wi-Fi — can still connect by
+        # relaying media over TCP/443. For reliability, run your own coturn or a
+        # free Metered account and set TURN_URL/TURN_USER/TURN_PASS instead.
+        servers.append(RTCIceServer(
+            urls=[
+                "turn:openrelay.metered.ca:443",
+                "turn:openrelay.metered.ca:443?transport=tcp",
+                "turn:openrelay.metered.ca:80",
+            ],
+            username="openrelayproject",
+            credential="openrelayproject",
+        ))
     return servers
 
 
@@ -364,7 +383,7 @@ async def connect_once():
                 await pc.close()
             pc = RTCPeerConnection(RTCConfiguration(iceServers=build_ice_servers()))
             track = ScreenTrack(MONITOR, FPS)
-            pc.addTrack(track)
+            sender = pc.addTrack(track)
 
             channel = pc.createDataChannel("input")
 
@@ -393,6 +412,18 @@ async def connect_once():
                 print("connection state:", pc.connectionState)
 
             await pc.setLocalDescription(await pc.createOffer())
+
+            # Cap the encoder bitrate now that the encoding params exist, so it
+            # can't saturate the link and trigger the freeze-then-fail spiral.
+            try:
+                params = sender.getParameters()
+                if params.encodings:
+                    params.encodings[0].maxBitrate = MAX_BITRATE
+                    await sender.setParameters(params)
+                    print(f"max bitrate capped at {MAX_BITRATE // 1000} kbps")
+            except Exception as e:
+                print("could not set bitrate cap:", e)
+
             await wait_ice_gathering_complete(pc)
             await ws.send(json.dumps({
                 "type": "offer",
