@@ -1,0 +1,6 @@
+node_modules/
+*.log
+__pycache__/
+*.pyc
+.env
+server.pid
