@@ -29,10 +29,10 @@ import asyncio
 import ctypes
 import fractions
 import json
-import math
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import mss
 import numpy as np
@@ -110,6 +110,12 @@ def send_mouse_move_rel(dx: int, dy: int) -> None:
     ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
+# One wheel "notch" is WHEEL_DELTA (120). The browser reports ~100 px per notch,
+# so scaling by ~1.2 makes a notch in the browser equal a real notch on the host.
+def send_mouse_wheel(amount: int) -> None:
+    ctypes.windll.user32.mouse_event(0x0800, 0, 0, int(amount), 0)   # MOUSEEVENTF_WHEEL
+
+
 # ----------------------------------------------------------------------------
 # Cursor overlay
 # mss captures the framebuffer, which does NOT include the mouse cursor (it's a
@@ -177,9 +183,18 @@ def _grab(monitor_index: int):
     # mss is not thread-safe across threads, so keep one instance per worker thread.
     if not hasattr(_thread_local, "sct"):
         _thread_local.sct = mss.mss()
-    sct = _thread_local.sct
-    mon = sct.monitors[monitor_index]
-    shot = sct.grab(mon)
+    try:
+        sct = _thread_local.sct
+        mon = sct.monitors[monitor_index]
+        shot = sct.grab(mon)
+    except Exception:
+        # A game switching display mode / resolution can invalidate the capture
+        # handle. Re-create mss (which re-reads the monitor geometry) and retry
+        # once so a single bad grab doesn't kill the stream.
+        _thread_local.sct = mss.mss()
+        sct = _thread_local.sct
+        mon = sct.monitors[monitor_index]
+        shot = sct.grab(mon)
     # shot.rgb is read-only; .copy() makes it writable so we can paint the cursor.
     arr = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3).copy()
     return arr, mon["left"], mon["top"]
@@ -199,6 +214,10 @@ class ScreenTrack(VideoStreamTrack):
         self.show_cursor = True
         self._start = None
         self._timestamp = 0
+        self._last_arr = None     # last good frame, reused if a grab fails
+        # One dedicated capture thread so a single mss instance is reused and
+        # screen grabs never block the asyncio event loop.
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     async def recv(self) -> VideoFrame:
         loop = asyncio.get_event_loop()
@@ -215,9 +234,18 @@ class ScreenTrack(VideoStreamTrack):
             if delay > 0:
                 await asyncio.sleep(delay)
 
-        arr, mon_left, mon_top = await loop.run_in_executor(None, _grab, self._monitor)
-        if self.show_cursor:
-            draw_cursor(arr, mon_left, mon_top)
+        try:
+            arr, mon_left, mon_top = await loop.run_in_executor(self._executor, _grab, self._monitor)
+            if self.show_cursor:
+                draw_cursor(arr, mon_left, mon_top)
+            self._last_arr = arr
+        except Exception as e:
+            # Never let a capture error kill the track (which freezes the stream
+            # and drops the connection). Reuse the last good frame, or black.
+            print("capture error (reusing last frame):", e)
+            arr = self._last_arr
+            if arr is None:
+                arr = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
 
         frame = VideoFrame.from_ndarray(arr, format="rgb24")
         if self.scale < 0.999:
@@ -286,8 +314,8 @@ def handle_input(msg: dict) -> None:
         elif t == "mouseup":
             pyautogui.mouseUp(button=BUTTONS.get(msg.get("button", 0), "left"), _pause=False)
         elif t == "wheel":
-            clicks = -int(math.copysign(max(1, abs(msg["dy"]) / 100), msg["dy"]))
-            pyautogui.scroll(clicks, _pause=False)
+            # Browser deltaY is positive when scrolling down; wheel is positive up.
+            send_mouse_wheel(-int(round(msg["dy"] * 1.2)))
         elif t == "keydown":
             k = code_to_key(msg.get("code", ""), msg.get("key", ""))
             if k:

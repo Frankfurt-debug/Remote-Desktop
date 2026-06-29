@@ -21,6 +21,7 @@
   /* Toolbar (top-left) */
   #toolbar { position:fixed; top:10px; left:10px; z-index:6; display:none; gap:6px; }
   body.streaming #toolbar { display:flex; }
+  body.hidetoolbar #toolbar { display:none; }
   .ui { background:rgba(20,20,26,.72); color:var(--txt); border:1px solid var(--line);
         border-radius:8px; padding:7px 11px; font-size:13px; cursor:pointer; backdrop-filter:blur(4px); }
   .ui:hover { background:rgba(40,40,52,.9); }
@@ -114,7 +115,9 @@
 
       <div class="grp">
         <h2>Overlay</h2>
-        <div class="field"><label for="hudOn">Show stats (FPS / latency)</label><input type="checkbox" id="hudOn"></div>
+        <div class="field"><label for="hudOn">Show stats (top-right)</label><input type="checkbox" id="hudOn"></div>
+        <div class="field"><label for="toolbarOn">Show toolbar buttons (top-left)</label><input type="checkbox" id="toolbarOn"></div>
+        <div style="font-size:11px;color:var(--dim);margin-top:4px">Tip: with the toolbar hidden, press <b>Esc</b> to reopen this menu.</div>
       </div>
 
       <button class="btn" id="connectBtn">Connect</button>
@@ -136,7 +139,7 @@ const sameOrigin = location.host
 const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
-  lock: true, sens: 1, smooth: true, cursor: true, hud: true,
+  lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -151,14 +154,14 @@ function formToS() {
   S.room = $("room").value.trim() || "default";
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
-  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked;
+  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
-  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud;
+  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -198,6 +201,7 @@ function closeSettings() {
   applyVideoStyle();
   sendConfig();
   hud.style.display = S.hud ? "block" : "none";
+  document.body.classList.toggle("hidetoolbar", !S.toolbar);
   overlay.classList.add("hidden");
   settingsOpen = false;
   updateCursorHide();
@@ -249,7 +253,13 @@ async function handleOffer(m) {
     inputChannel.onopen = () => sendConfig();
   };
   pc.onconnectionstatechange = () => {
-    if (["failed", "disconnected", "closed"].includes(pc.connectionState)) { setStatus("connection lost"); teardown(); }
+    const st = pc.connectionState;
+    // "disconnected" is usually a temporary stutter that recovers on its own —
+    // do NOT tear down, or a long freeze needlessly kicks you to the menu.
+    // Only give up on "failed"/"closed".
+    if (st === "disconnected") setStatus("⚠ connection unstable, recovering…");
+    else if (st === "connected") setStatus("");
+    else if (st === "failed" || st === "closed") { setStatus("connection lost"); teardown(); }
   };
   await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
@@ -309,7 +319,12 @@ document.addEventListener("mousedown", (e) => { if (connected && !settingsOpen) 
 document.addEventListener("mouseup",   (e) => { if (connected && !settingsOpen) sendInput({ type: "mouseup", button: e.button }); });
 document.addEventListener("wheel", (e) => {
   if (!connected || settingsOpen) return;
-  e.preventDefault(); sendInput({ type: "wheel", dy: e.deltaY });
+  e.preventDefault();
+  // Normalise to pixels: some mice/trackpads report lines (mode 1) or pages (2).
+  let dy = e.deltaY;
+  if (e.deltaMode === 1) dy *= 33;
+  else if (e.deltaMode === 2) dy *= 400;
+  sendInput({ type: "wheel", dy });
 }, { passive: false });
 document.addEventListener("contextmenu", (e) => { if (connected) e.preventDefault(); });
 
