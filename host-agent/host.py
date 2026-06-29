@@ -59,6 +59,14 @@ TURN_URL = os.environ.get("TURN_URL")           # e.g. turn:turn.example.com:347
 TURN_USER = os.environ.get("TURN_USER")
 TURN_PASS = os.environ.get("TURN_PASS")
 
+# Make the process DPI-aware so screen capture, cursor position and pyautogui
+# all agree on physical pixels (otherwise the drawn cursor and clicks drift on
+# displays with scaling above 100%). Must run before reading the screen size.
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 # pyautogui: no delay between calls, and don't abort when the cursor hits a corner.
 pyautogui.PAUSE = 0
 pyautogui.FAILSAFE = False
@@ -103,6 +111,63 @@ def send_mouse_move_rel(dx: int, dy: int) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Cursor overlay
+# mss captures the framebuffer, which does NOT include the mouse cursor (it's a
+# hardware overlay). So we query the real OS cursor position and paint a simple
+# arrow onto each frame, otherwise the remote viewer sees no pointer at all.
+# ----------------------------------------------------------------------------
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def get_cursor_pos():
+    pt = _POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
+
+
+# A classic arrow shape. 'X' = black outline, '.' = white fill, ' ' = transparent.
+# The hotspot (the actual click point) is the top-left tip at (0, 0).
+_ARROW = [
+    "X          ",
+    "XX         ",
+    "X.X        ",
+    "X..X       ",
+    "X...X      ",
+    "X....X     ",
+    "X.....X    ",
+    "X......X   ",
+    "X.......X  ",
+    "X........X ",
+    "X.....XXXXX",
+    "X..X..X    ",
+    "X.X X..X   ",
+    "XX  X..X   ",
+    "X    X..X  ",
+    "     X..X  ",
+    "      XX   ",
+]
+# Pre-split into black and white pixel offsets for a fast blit.
+_CURSOR_BLACK = [(y, x) for y, row in enumerate(_ARROW) for x, c in enumerate(row) if c == "X"]
+_CURSOR_WHITE = [(y, x) for y, row in enumerate(_ARROW) for x, c in enumerate(row) if c == "."]
+
+
+def draw_cursor(arr, mon_left: int, mon_top: int) -> None:
+    cx, cy = get_cursor_pos()
+    rx, ry = cx - mon_left, cy - mon_top
+    h, w, _ = arr.shape
+    if not (0 <= rx < w and 0 <= ry < h):
+        return
+    for px, val in ((_CURSOR_BLACK, 0), (_CURSOR_WHITE, 255)):
+        for dy, dx in px:
+            y, x = ry + dy, rx + dx
+            if 0 <= y < h and 0 <= x < w:
+                arr[y, x, 0] = val
+                arr[y, x, 1] = val
+                arr[y, x, 2] = val
+
+
+# ----------------------------------------------------------------------------
 # Screen capture track
 # ----------------------------------------------------------------------------
 _thread_local = threading.local()
@@ -115,8 +180,9 @@ def _grab(monitor_index: int):
     sct = _thread_local.sct
     mon = sct.monitors[monitor_index]
     shot = sct.grab(mon)
-    # BGRA, shape (h, w, 4)
-    return np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3)
+    # shot.rgb is read-only; .copy() makes it writable so we can paint the cursor.
+    arr = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3).copy()
+    return arr, mon["left"], mon["top"]
 
 
 class ScreenTrack(VideoStreamTrack):
@@ -145,7 +211,8 @@ class ScreenTrack(VideoStreamTrack):
             if delay > 0:
                 await asyncio.sleep(delay)
 
-        arr = await loop.run_in_executor(None, _grab, self._monitor)
+        arr, mon_left, mon_top = await loop.run_in_executor(None, _grab, self._monitor)
+        draw_cursor(arr, mon_left, mon_top)
         frame = VideoFrame.from_ndarray(arr, format="rgb24")
         frame.pts = self._timestamp
         frame.time_base = fractions.Fraction(1, VIDEO_CLOCK_RATE)

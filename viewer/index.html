@@ -153,20 +153,43 @@ video.addEventListener("click", () => {
   if (!locked()) video.requestPointerLock();
 });
 
+// Mouse movement is coalesced and flushed once per animation frame (~60 Hz).
+// A raw mousemove can fire hundreds of times a second; sending each one floods
+// the data channel and makes motion feel laggy/jerky. Accumulating relative
+// deltas (and keeping only the latest absolute position) gives smooth motion
+// with a fraction of the messages.
+const SENS = parseFloat(qs.get("sens")) || 1;   // mouse sensitivity multiplier
+let accDx = 0, accDy = 0, pendingAbs = null;
+
 document.addEventListener("mousemove", (e) => {
   if (!inputChannel) return;
   if (locked()) {
-    // Relative deltas for gaming.
-    sendInput({ type: "mousemoverel", dx: e.movementX, dy: e.movementY });
+    accDx += e.movementX;
+    accDy += e.movementY;
   } else {
-    // Absolute, normalised to the video's displayed rectangle.
     const r = video.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
     const x = (e.clientX - r.left) / r.width;
     const y = (e.clientY - r.top) / r.height;
-    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) sendInput({ type: "mousemove", x, y });
+    if (x >= 0 && x <= 1 && y >= 0 && y <= 1) pendingAbs = { x, y };
   }
 });
+
+function flushMouse() {
+  if (inputChannel && inputChannel.readyState === "open") {
+    if (locked()) {
+      if (accDx !== 0 || accDy !== 0) {
+        sendInput({ type: "mousemoverel", dx: Math.round(accDx * SENS), dy: Math.round(accDy * SENS) });
+        accDx = 0; accDy = 0;
+      }
+    } else if (pendingAbs) {
+      sendInput({ type: "mousemove", x: pendingAbs.x, y: pendingAbs.y });
+      pendingAbs = null;
+    }
+  }
+  requestAnimationFrame(flushMouse);
+}
+requestAnimationFrame(flushMouse);
 
 document.addEventListener("mousedown", (e) => {
   if (!inputChannel || video.srcObject === null) return;
