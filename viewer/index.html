@@ -382,6 +382,13 @@ async function handleOffer(m) {
     if (e.candidate && e.candidate.candidate) {
       const t = (e.candidate.candidate.match(/ typ (\w+)/) || [])[1];
       if (t && candCounts[t] != null) candCounts[t]++;
+      // Trickle each candidate to the host as it's found.
+      wsSend({ type: "ice", candidate: {
+        candidate: e.candidate.candidate,
+        sdpMid: e.candidate.sdpMid,
+        sdpMLineIndex: e.candidate.sdpMLineIndex,
+      }});
+      if (t === "relay") dbg("relay candidate ready ✓", "ok");
     }
   };
   pc.oniceconnectionstatechange = () => {
@@ -400,11 +407,11 @@ async function handleOffer(m) {
 
   await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
-  await waitIceComplete(pc);
-  dbg(`ICE gathered — host:${candCounts.host} stun:${candCounts.srflx} relay:${candCounts.relay}`);
-  if (candCounts.relay === 0) dbg("No relay candidates (no working TURN) — fine on same network, needed for school.", "dim");
+  // Trickle ICE: send the answer NOW, before gathering candidates. Waiting for
+  // the (slow) relay allocation first let the signaling socket drop before the
+  // answer ever went out. Candidates follow via onicecandidate above.
   wsSend({ type: "answer", sdp: pc.localDescription.sdp });
-  dbg("Answer sent → connecting media…");
+  dbg("Answer sent immediately (trickle) → gathering candidates…");
 }
 
 function waitIceComplete(pc) {

@@ -45,6 +45,7 @@ from aiortc import (
     RTCSessionDescription,
     VideoStreamTrack,
 )
+from aiortc.sdp import candidate_from_sdp
 from av import VideoFrame
 
 # ----------------------------------------------------------------------------
@@ -442,6 +443,21 @@ async def connect_once():
                         RTCSessionDescription(sdp=msg["sdp"], type="answer")
                     )
                     print("answer applied")
+
+            elif mtype == "ice":
+                # Trickled ICE candidate from the viewer.
+                cand_info = msg.get("candidate")
+                if pc and cand_info and cand_info.get("candidate"):
+                    try:
+                        sdp = cand_info["candidate"]
+                        if sdp.startswith("candidate:"):
+                            sdp = sdp[len("candidate:"):]
+                        cand = candidate_from_sdp(sdp)
+                        cand.sdpMid = cand_info.get("sdpMid")
+                        cand.sdpMLineIndex = cand_info.get("sdpMLineIndex")
+                        await pc.addIceCandidate(cand)
+                    except Exception as e:
+                        print("ice add error:", e)
 
             elif mtype == "peer-left":
                 # The signaling WebSocket is only needed for the handshake. Once
