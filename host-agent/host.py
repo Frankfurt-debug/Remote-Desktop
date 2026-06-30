@@ -347,15 +347,11 @@ def build_ice_servers():
         servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
     else:
         # Metered TURN relay so the host allocates a relay candidate the viewer
-        # can always reach. The host is on an unfiltered network, so plain TURN
-        # over UDP/TCP is fine here (the viewer uses turns:443 to beat its filter).
+        # can reach. Use plain UDP only — the host is on an unfiltered network, and
+        # aioice's TURN channel-binding is most reliable over UDP (the TCP/TLS
+        # transports were throwing 401s on channel-bind and breaking the relay).
         servers.append(RTCIceServer(
-            urls=[
-                "turn:global.relay.metered.ca:80",
-                "turn:global.relay.metered.ca:80?transport=tcp",
-                "turn:global.relay.metered.ca:443",
-                "turn:global.relay.metered.ca:443?transport=tcp",
-            ],
+            urls=["turn:global.relay.metered.ca:80"],
             username="36292581ea281c3ca146486f",
             credential="VOadz1IOJqzHUZRa",
         ))
