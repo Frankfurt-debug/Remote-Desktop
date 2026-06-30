@@ -54,10 +54,6 @@ SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
 ROOM = os.environ.get("ROOM", "default")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
-# Cap the encoder so it can't try to send more than the link (or a school
-# network's relay) can carry — an uncapped bitrate is what saturates the
-# connection and makes it freeze then fail. ~5 Mbps suits 720p-ish streaming.
-MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "5000000"))
 
 TURN_URL = os.environ.get("TURN_URL")           # e.g. turn:turn.example.com:3478
 TURN_USER = os.environ.get("TURN_USER")
@@ -345,24 +341,6 @@ def build_ice_servers():
     return servers
 
 
-def cap_video_bitrate(sdp: str, kbps: int) -> str:
-    """Insert a `b=AS:<kbps>` bandwidth line into the video media section.
-
-    aiortc honours the bandwidth in the *remote* description as the cap for its
-    encoder, so applying this to the browser's answer keeps the stream from
-    saturating the link (which is what made it freeze then fail)."""
-    out, in_video, inserted = [], False, False
-    for line in sdp.replace("\r\n", "\n").split("\n"):
-        if line.startswith("m="):
-            in_video = line.startswith("m=video")
-        out.append(line)
-        if in_video and line.startswith("c=") and not inserted:
-            out.append(f"b=AS:{kbps}")
-            out.append(f"b=TIAS:{kbps * 1000}")
-            inserted = True
-    return "\r\n".join(out)
-
-
 async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
@@ -435,11 +413,10 @@ async def connect_once():
 
             elif mtype == "answer":
                 if pc:
-                    sdp = cap_video_bitrate(msg["sdp"], MAX_BITRATE // 1000)
                     await pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=sdp, type="answer")
+                        RTCSessionDescription(sdp=msg["sdp"], type="answer")
                     )
-                    print(f"answer applied (bitrate capped at {MAX_BITRATE // 1000} kbps)")
+                    print("answer applied")
 
             elif mtype == "peer-left":
                 print("viewer left")

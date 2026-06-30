@@ -58,6 +58,11 @@
   .btn:hover { filter:brightness(1.08); }
   .btn.sec { background:#2a2a32; margin-top:8px; }
   #status { position:fixed; bottom:8px; left:10px; color:#6f6; font-size:12px; z-index:5; opacity:.7; pointer-events:none; }
+  #debug { position:fixed; bottom:30px; left:10px; z-index:7; width:340px; max-height:42vh; overflow:auto;
+           background:rgba(8,8,12,.86); border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+           font:11px/1.45 ui-monospace, Menlo, Consolas, monospace; color:#cdd; display:none; }
+  #debug.show { display:block; }
+  #debug .ok { color:#6f6; } #debug .bad { color:#ff6b6b; } #debug .warn { color:#ffd479; } #debug .dim { color:#888; }
   .hint { font-size:12px; color:var(--dim); margin-top:14px; line-height:1.5; }
 </style>
 </head>
@@ -71,6 +76,7 @@
   </div>
 
   <div id="hud"></div>
+  <div id="debug"></div>
   <div id="status"></div>
 
   <div id="overlay">
@@ -130,7 +136,20 @@
 const BAKED_URL = "wss://remote-desktop-signaling.onrender.com";   // <-- your Render server
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
-const video = $("video"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status");
+const video = $("video"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
+
+// ---- Diagnostics log ------------------------------------------------------
+// Shows each connection step so we can see exactly where it gets stuck:
+// WebSocket -> register -> offer -> answer -> ICE -> first video frame.
+function dbg(msg, cls = "") {
+  const t = new Date().toLocaleTimeString();
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = `${t}  ${msg}`;
+  debugEl.appendChild(line);
+  debugEl.scrollTop = debugEl.scrollHeight;
+  console.log("[rd]", msg);
+}
 
 // ---- Settings (persisted) -------------------------------------------------
 const sameOrigin = location.host
@@ -227,48 +246,75 @@ const ICE = [
   // ICE.push({ urls: "turn:turn.example.com:443?transport=tcp", username: "...", credential: "..." });
 ];
 
+let gotFirstFrame = false, candCounts = { host: 0, srflx: 0, relay: 0 };
+
 function connect() {
+  debugEl.innerHTML = ""; debugEl.classList.add("show");
+  gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
+  connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
+  dbg("Opening WebSocket: " + S.server);
   ws = new WebSocket(S.server);
-  ws.onopen = () => { wsSend({ type: "register", role: "viewer", room: S.room }); setStatus("waiting for host… (free server can take ~50s to wake)"); };
+  ws.onopen = () => {
+    dbg("WebSocket OPEN ✓ — signaling reachable", "ok");
+    wsSend({ type: "register", role: "viewer", room: S.room });
+    dbg("Registered as viewer (room: " + S.room + ")");
+    setStatus("waiting for host… (free server can take ~50s to wake)");
+  };
   ws.onmessage = async (ev) => {
     const m = JSON.parse(ev.data);
-    if (m.type === "offer") await handleOffer(m);
-    else if (m.type === "host-ready") setStatus("host ready, negotiating…");
-    else if (m.type === "peer-left") { setStatus("host disconnected"); teardown(); }
+    if (m.type === "offer") { dbg("Offer received from host ✓", "ok"); await handleOffer(m); }
+    else if (m.type === "host-ready") { dbg("Host is ready"); setStatus("host ready, negotiating…"); }
+    else if (m.type === "peer-left") { dbg("Host left", "warn"); setStatus("host disconnected"); teardown(); }
   };
-  ws.onclose = () => setStatus("signaling closed");
-  ws.onerror = () => setStatus("signaling error — is the server URL right?");
+  ws.onclose = () => { dbg("WebSocket CLOSED", "warn"); setStatus("signaling closed"); };
+  ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
 }
 
 async function handleOffer(m) {
-  setStatus("offer received");
+  setStatus("negotiating…");
   pc = new RTCPeerConnection({ iceServers: ICE });
+
   pc.ontrack = (e) => {
+    dbg("Video track received ✓ (waiting for frames…)", "ok");
     video.srcObject = e.streams[0];
     connected = true;
     document.body.classList.add("streaming");
     applyVideoStyle();
-    closeSettings();                 // hide panel, push current config to host
+    closeSettings();
     setStatus("");
   };
   pc.ondatachannel = (e) => {
     inputChannel = e.channel;
-    inputChannel.onopen = () => sendConfig();
+    inputChannel.onopen = () => { dbg("Input channel open ✓", "ok"); sendConfig(); };
+  };
+  pc.onicecandidate = (e) => {
+    if (e.candidate && e.candidate.candidate) {
+      const t = (e.candidate.candidate.match(/ typ (\w+)/) || [])[1];
+      if (t && candCounts[t] != null) candCounts[t]++;
+    }
+  };
+  pc.oniceconnectionstatechange = () => {
+    const s = pc.iceConnectionState;
+    dbg("ICE: " + s, s === "connected" || s === "completed" ? "ok" : (s === "failed" ? "bad" : "dim"));
+    if (s === "failed")
+      dbg("→ No network path found. This network likely needs a TURN relay.", "bad");
   };
   pc.onconnectionstatechange = () => {
     const st = pc.connectionState;
-    // "disconnected" is usually a temporary stutter that recovers on its own —
-    // do NOT tear down, or a long freeze needlessly kicks you to the menu.
-    // Only give up on "failed"/"closed".
+    dbg("Peer: " + st, st === "connected" ? "ok" : (st === "failed" ? "bad" : "dim"));
     if (st === "disconnected") setStatus("⚠ connection unstable, recovering…");
     else if (st === "connected") setStatus("");
     else if (st === "failed" || st === "closed") { setStatus("connection lost"); teardown(); }
   };
+
   await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
   await pc.setLocalDescription(await pc.createAnswer());
   await waitIceComplete(pc);
+  dbg(`ICE gathered — host:${candCounts.host} stun:${candCounts.srflx} relay:${candCounts.relay}`);
+  if (candCounts.relay === 0) dbg("No relay candidates (no working TURN) — fine on same network, needed for school.", "dim");
   wsSend({ type: "answer", sdp: pc.localDescription.sdp });
+  dbg("Answer sent → connecting media…");
 }
 
 function waitIceComplete(pc) {
@@ -348,30 +394,46 @@ document.addEventListener("keyup", (e) => {
   sendInput({ type: "keyup", code: e.code, key: e.key });
 });
 
-// ---- Stats HUD ------------------------------------------------------------
-let lastBytes = 0, lastTs = 0;
+// ---- Stats HUD + media diagnostics ----------------------------------------
+let lastBytes = 0, lastTs = 0, connectedAt = 0, noFrameWarned = false;
 async function pollStats() {
-  if (pc && S.hud && connected) {
-    try {
-      const stats = await pc.getStats();
-      let fps = "–", w = 0, h = 0, rtt = null, bytes = 0, ts = 0;
-      stats.forEach((r) => {
-        if (r.type === "inbound-rtp" && r.kind === "video") {
-          if (r.framesPerSecond != null) fps = Math.round(r.framesPerSecond);
-          w = r.frameWidth || w; h = r.frameHeight || h; bytes = r.bytesReceived || 0; ts = r.timestamp || 0;
-        }
-        if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime != null) rtt = r.currentRoundTripTime;
-      });
-      let kbps = 0;
-      if (lastTs && ts > lastTs) kbps = Math.round((bytes - lastBytes) * 8 / (ts - lastTs));
-      lastBytes = bytes; lastTs = ts;
-      const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
+  if (!pc || !connected) return;
+  if (!connectedAt) connectedAt = Date.now();
+  try {
+    const stats = await pc.getStats();
+    let fps = "–", w = 0, h = 0, rtt = null, bytes = 0, ts = 0, frames = 0;
+    stats.forEach((r) => {
+      if (r.type === "inbound-rtp" && r.kind === "video") {
+        if (r.framesPerSecond != null) fps = Math.round(r.framesPerSecond);
+        w = r.frameWidth || w; h = r.frameHeight || h;
+        bytes = r.bytesReceived || 0; ts = r.timestamp || 0; frames = r.framesDecoded || 0;
+      }
+      if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime != null) rtt = r.currentRoundTripTime;
+    });
+
+    // The key diagnostic: are video frames actually arriving?
+    if (bytes > 0 && !gotFirstFrame) {
+      gotFirstFrame = true;
+      dbg("First video data arriving ✓ — IT WORKS", "ok");
+      setTimeout(() => debugEl.classList.remove("show"), 4000);
+    }
+    if (!gotFirstFrame && Date.now() - connectedAt > 8000 && !noFrameWarned) {
+      noFrameWarned = true;
+      dbg("Track connected but NO video frames after 8s.", "bad");
+      dbg("→ Signaling works; the media path is blocked. Needs a TURN relay.", "bad");
+    }
+
+    let kbps = 0;
+    if (lastTs && ts > lastTs) kbps = Math.round((bytes - lastBytes) * 8 / (ts - lastTs));
+    lastBytes = bytes; lastTs = ts;
+    const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
+    if (S.hud) {
       hud.innerHTML =
         `FPS <b>${fps}</b><br>Ping <b>${ping}</b><br>` +
-        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b>` +
+        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>Frames <b>${frames}</b>` +
         (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
-    } catch {}
-  }
+    }
+  } catch {}
 }
 setInterval(pollStats, 1000);
 
