@@ -250,12 +250,16 @@ function toggleFullscreen() {
 }
 
 // ---- WebRTC / signaling ---------------------------------------------------
+// Metered TURN relay. The turns:...:443 entry tunnels the whole stream inside
+// TLS on 443 so it looks like HTTPS — the path that gets through a school filter
+// (use it with the "Force relay" toggle on). Regenerate these in your Metered
+// dashboard if the quota gets abused.
 const ICE = [
-  { urls: ["stun:stun.l.google.com:19302"] },
-  // For a restrictive network (school Wi-Fi), add a REAL TURN server here — e.g.
-  // Cloudflare or your own coturn. Do not add a dead public relay; an
-  // unreachable TURN server breaks connections that would otherwise work.
-  // ICE.push({ urls: "turn:turn.example.com:443?transport=tcp", username: "...", credential: "..." });
+  { urls: "stun:stun.relay.metered.ca:80" },
+  { urls: "turn:global.relay.metered.ca:80", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
+  { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
+  { urls: "turn:global.relay.metered.ca:443", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
+  { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
 ];
 
 let gotFirstFrame = false, candCounts = { host: 0, srflx: 0, relay: 0 };
@@ -296,18 +300,36 @@ async function networkTest() {
   dbg(srflx ? "3. STUN/UDP to internet: works ✓ (media path is open at UDP level)"
             : "3. STUN/UDP to internet: BLOCKED ✗ (UDP filtered)", srflx ? "ok" : "bad");
 
+  // 4. THE key test for this network: can we allocate a relay candidate through
+  //    the TURNS-on-443 server? If yes, the disguised-as-HTTPS path is open.
+  dbg("4. Testing TURNS relay on 443 (this is the one that matters)…");
+  const relay = await new Promise((res) => {
+    const t = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: "relay" });
+    let r = false;
+    t.onicecandidate = (e) => {
+      if (!e.candidate) { try { t.close(); } catch {} return res(r); }
+      if (/ typ relay/.test(e.candidate.candidate)) r = true;
+    };
+    t.createDataChannel("probe");
+    t.createOffer().then((o) => t.setLocalDescription(o));
+    setTimeout(() => { try { t.close(); } catch {} res(r); }, 12000);
+  });
+  dbg(relay ? "4. TURNS relay (443): REACHABLE ✓ — the disguised tunnel works!"
+            : "4. TURNS relay (443): not reachable ✗ — filter is blocking even this", relay ? "ok" : "bad");
+
   // Verdict
   dbg("— VERDICT —");
   if (!wsOk) {
     dbg("Signaling itself is blocked — the server URL is filtered on this network.", "bad");
+  } else if (relay) {
+    dbg("TURNS relay works! Turn ON 'Force relay' in settings, then Connect —", "ok");
+    dbg("the video should now get through. 🎉", "ok");
   } else if (!srflx) {
-    dbg("Signaling works but UDP is blocked. You need a TURN relay over TCP/443.", "bad");
+    dbg("UDP and the TURNS relay are both blocked — this network is very locked down.", "bad");
   } else {
-    dbg("Signaling ✓ and UDP ✓. If the real connection still fails AFTER 'ICE connected',", "warn");
-    dbg("then the encrypted media (DTLS) is being selectively filtered (DPI). Only a", "warn");
-    dbg("TURNS relay on 443 can disguise it as HTTPS — or the device is too locked down.", "warn");
+    dbg("Signaling + UDP work, but the TURNS relay is blocked. The filter is", "bad");
+    dbg("inspecting TLS and rejecting the tunnel. TURNS can't get through here.", "bad");
   }
-  dbg("Now click Connect to test the real handshake.");
 }
 
 function connect() {

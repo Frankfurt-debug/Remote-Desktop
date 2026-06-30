@@ -333,11 +333,23 @@ def handle_input(msg: dict) -> None:
 # ----------------------------------------------------------------------------
 def build_ice_servers():
     servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
-    # Add a real TURN server only when configured (set TURN_URL/USER/PASS). We
-    # do NOT ship a default public relay — the free ones are dead/unreliable and
-    # adding an unreachable relay actually breaks otherwise-working connections.
     if TURN_URL:
+        # User-supplied TURN overrides the default.
         servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
+    else:
+        # Metered TURN relay so the host allocates a relay candidate the viewer
+        # can always reach. The host is on an unfiltered network, so plain TURN
+        # over UDP/TCP is fine here (the viewer uses turns:443 to beat its filter).
+        servers.append(RTCIceServer(
+            urls=[
+                "turn:global.relay.metered.ca:80",
+                "turn:global.relay.metered.ca:80?transport=tcp",
+                "turn:global.relay.metered.ca:443",
+                "turn:global.relay.metered.ca:443?transport=tcp",
+            ],
+            username="36292581ea281c3ca146486f",
+            credential="VOadz1IOJqzHUZRa",
+        ))
     return servers
 
 
