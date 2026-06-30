@@ -76,6 +76,7 @@
     <button class="ui" id="btnFull">⛶ Fullscreen</button>
     <button class="ui" id="btnLock">🖱 Capture mouse</button>
     <button class="ui" id="btnLog">📋 Log</button>
+    <button class="ui" id="btnLeave">⏏ Leave</button>
   </div>
 
   <div id="hud"></div>
@@ -243,6 +244,17 @@ $("testBtn").onclick = () => { formToS(); saveSettings(); networkTest(); };
 $("btnFull").onclick = toggleFullscreen;
 $("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
 $("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
+$("btnLeave").onclick = leave;
+
+// Explicit leave: tell the host so it cleanly drops the connection (otherwise
+// the host keeps the stream alive to survive flaky signaling, which would block
+// the next reconnect). Also fired automatically when the page is closed/hidden.
+function leave() {
+  try { wsSend({ type: "leave" }); } catch {}
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  teardown();
+}
+window.addEventListener("pagehide", () => { try { wsSend({ type: "leave" }); } catch {} });
 
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();

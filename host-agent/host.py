@@ -220,6 +220,14 @@ class ScreenTrack(VideoStreamTrack):
         # screen grabs never block the asyncio event loop.
         self._executor = ThreadPoolExecutor(max_workers=1)
 
+    def stop(self):
+        # Called by aiortc when the peer connection closes — shut the capture
+        # thread down so reconnects don't leak threads/mss instances.
+        super().stop()
+        if self._executor:
+            self._executor.shutdown(wait=False)
+            self._executor = None
+
     async def recv(self) -> VideoFrame:
         loop = asyncio.get_event_loop()
         fps = max(1, min(60, int(self.fps)))
@@ -458,6 +466,14 @@ async def connect_once():
                         await pc.addIceCandidate(cand)
                     except Exception as e:
                         print("ice add error:", e)
+
+            elif mtype == "leave":
+                # Explicit "I'm leaving" from the viewer (button / page close).
+                # Always tear down cleanly so the next connection starts fresh.
+                print("viewer left (explicit)")
+                if pc:
+                    await pc.close()
+                    pc = None
 
             elif mtype == "peer-left":
                 # The signaling WebSocket is only needed for the handshake. Once
