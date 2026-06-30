@@ -344,6 +344,10 @@ function connect() {
     wsSend({ type: "register", role: "viewer", room: S.room });
     dbg("Registered as viewer (room: " + S.room + ")");
     setStatus("waiting for host… (free server can take ~50s to wake)");
+    // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and
+    // some school filters) don't silently close the signaling socket.
+    clearInterval(ws._ka);
+    ws._ka = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "keepalive" }); }, 15000);
   };
   ws.onmessage = async (ev) => {
     const m = JSON.parse(ev.data);
@@ -351,7 +355,7 @@ function connect() {
     else if (m.type === "host-ready") { dbg("Host is ready"); setStatus("host ready, negotiating…"); }
     else if (m.type === "peer-left") { dbg("Host left", "warn"); setStatus("host disconnected"); teardown(); }
   };
-  ws.onclose = () => { dbg("WebSocket CLOSED", "warn"); setStatus("signaling closed"); };
+  ws.onclose = () => { clearInterval(ws._ka); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
   ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
 }
 

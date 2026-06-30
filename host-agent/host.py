@@ -444,10 +444,18 @@ async def connect_once():
                     print("answer applied")
 
             elif mtype == "peer-left":
-                print("viewer left")
-                if pc:
-                    await pc.close()
-                    pc = None
+                # The signaling WebSocket is only needed for the handshake. Once
+                # the media is connected it flows independently (peer-to-peer /
+                # via the relay), so a dropped signaling socket must NOT tear the
+                # video down — otherwise a flaky/filtered network kills a working
+                # stream. Only clean up if the media never actually connected.
+                if pc and pc.connectionState == "connected":
+                    print("viewer signaling dropped — media still connected, keeping it alive")
+                else:
+                    print("viewer left")
+                    if pc:
+                        await pc.close()
+                        pc = None
 
 
 async def run():
