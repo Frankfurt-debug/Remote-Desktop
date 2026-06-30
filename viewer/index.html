@@ -131,6 +131,7 @@
       </div>
 
       <button class="btn" id="connectBtn">Connect</button>
+      <button class="btn sec" id="testBtn">🔍 Test what's blocked</button>
       <button class="btn sec" id="doneBtn" style="display:none">Resume</button>
       <div class="hint" id="hint">After connecting, click the screen (or “Capture mouse”) to play games with Pointer Lock. Press <b>Esc</b> to release and reopen this panel.</div>
     </div>
@@ -213,6 +214,7 @@ function openSettings() {
   settingsOpen = true;
   if (document.pointerLockElement) document.exitPointerLock();
   $("connectBtn").style.display = connected ? "none" : "block";
+  $("testBtn").style.display = connected ? "none" : "block";
   $("doneBtn").style.display = connected ? "block" : "none";
   $("panelSub").textContent = connected ? "Adjust settings live." : "Configure, then connect.";
   sToForm();
@@ -234,6 +236,7 @@ function closeSettings() {
 $("btnSettings").onclick = openSettings;
 $("doneBtn").onclick = closeSettings;
 $("connectBtn").onclick = () => { formToS(); saveSettings(); connect(); };
+$("testBtn").onclick = () => { formToS(); saveSettings(); networkTest(); };
 $("btnFull").onclick = toggleFullscreen;
 $("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
 $("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
@@ -253,6 +256,56 @@ const ICE = [
 ];
 
 let gotFirstFrame = false, candCounts = { host: 0, srflx: 0, relay: 0 };
+
+// Standalone "what's blocked" probe: checks each network layer independently
+// and prints a plain-English verdict, without needing the host to be running.
+async function networkTest() {
+  debugEl.innerHTML = ""; debugEl.classList.add("show");
+  dbg("=== NETWORK TEST ===");
+
+  // 1. Signaling reachability (TLS/WebSocket on 443).
+  const wsOk = await new Promise((res) => {
+    let done = false;
+    const t = new WebSocket(S.server);
+    const finish = (ok) => { if (!done) { done = true; try { t.close(); } catch {} res(ok); } };
+    t.onopen = () => finish(true);
+    t.onerror = () => finish(false);
+    setTimeout(() => finish(false), 8000);
+  });
+  dbg(wsOk ? "1. Signaling (WebSocket/443): reachable ✓" : "1. Signaling (WebSocket/443): BLOCKED ✗",
+      wsOk ? "ok" : "bad");
+
+  // 2. STUN over UDP — do we get a server-reflexive candidate? That proves
+  //    UDP can reach the internet (the path WebRTC media normally uses).
+  const { srflx, host } = await new Promise((res) => {
+    const t = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    let s = false, h = false;
+    t.onicecandidate = (e) => {
+      if (!e.candidate) { try { t.close(); } catch {} return res({ srflx: s, host: h }); }
+      const typ = (e.candidate.candidate.match(/ typ (\w+)/) || [])[1];
+      if (typ === "srflx") s = true; if (typ === "host") h = true;
+    };
+    t.createDataChannel("probe");
+    t.createOffer().then((o) => t.setLocalDescription(o));
+    setTimeout(() => { try { t.close(); } catch {} res({ srflx: s, host: h }); }, 8000);
+  });
+  dbg("2. Local network candidates: " + (host ? "found ✓" : "none ✗"), host ? "ok" : "warn");
+  dbg(srflx ? "3. STUN/UDP to internet: works ✓ (media path is open at UDP level)"
+            : "3. STUN/UDP to internet: BLOCKED ✗ (UDP filtered)", srflx ? "ok" : "bad");
+
+  // Verdict
+  dbg("— VERDICT —");
+  if (!wsOk) {
+    dbg("Signaling itself is blocked — the server URL is filtered on this network.", "bad");
+  } else if (!srflx) {
+    dbg("Signaling works but UDP is blocked. You need a TURN relay over TCP/443.", "bad");
+  } else {
+    dbg("Signaling ✓ and UDP ✓. If the real connection still fails AFTER 'ICE connected',", "warn");
+    dbg("then the encrypted media (DTLS) is being selectively filtered (DPI). Only a", "warn");
+    dbg("TURNS relay on 443 can disguise it as HTTPS — or the device is too locked down.", "warn");
+  }
+  dbg("Now click Connect to test the real handshake.");
+}
 
 function connect() {
   debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
@@ -428,9 +481,13 @@ async function pollStats() {
       const ice = pc.iceConnectionState, peer = pc.connectionState;
       dbg(`No video after 8s. ICE=${ice}, Peer=${peer}`, "bad");
       if (ice === "connected" || ice === "completed") {
-        // Network path is fine — the secure handshake / host side is the problem.
-        dbg("→ Network path is OK, but the secure handshake didn't finish.", "bad");
-        dbg("→ Fully restart the host (close window, run start-host.bat).", "bad");
+        // ICE connected but DTLS never finished = the encrypted media is being
+        // selectively dropped. Signaling + STUN pass; the media handshake doesn't.
+        dbg("— VERDICT —", "bad");
+        dbg("Network path is OPEN (ICE connected) but the encrypted video handshake", "bad");
+        dbg("(DTLS) is being BLOCKED. Signaling ✓, STUN ✓, media ✗.", "bad");
+        dbg("This is deep-packet-inspection filtering on this device/network", "bad");
+        dbg("(e.g. school management software). Only a TURNS relay on 443 might bypass it.", "bad");
       } else {
         dbg("→ No network path (ICE " + ice + "). This network needs a TURN relay.", "bad");
       }
