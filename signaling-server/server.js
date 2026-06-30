@@ -28,7 +28,14 @@ const httpServer = http.createServer((req, res) => {
       res.end("signaling server ok");
       return;
     }
-    res.writeHead(200, { "Content-Type": "text/html" });
+    // Never cache the viewer, so a fresh visit always gets the newest version
+    // (otherwise the browser serves a stale copy and you miss recent changes).
+    res.writeHead(200, {
+      "Content-Type": "text/html",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      "Pragma": "no-cache",
+      "Expires": "0",
+    });
     res.end(data);
   });
 });
