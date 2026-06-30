@@ -93,6 +93,7 @@
         <input type="text" id="server" />
         <label class="full" style="font-size:13px;color:#d6d6da;margin-top:8px">Room</label>
         <input type="text" id="room" />
+        <div class="field" style="margin-top:10px"><label for="relayOn">Force relay (school / blocked networks)</label><input type="checkbox" id="relayOn"></div>
       </div>
 
       <div class="grp">
@@ -163,7 +164,7 @@ const sameOrigin = location.host
 const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
-  lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true,
+  lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -179,6 +180,7 @@ function formToS() {
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
+  S.relay = $("relayOn").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
@@ -186,6 +188,7 @@ function sToForm() {
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
+  $("relayOn").checked = S.relay;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -332,7 +335,9 @@ function connect() {
 
 async function handleOffer(m) {
   setStatus("negotiating…");
-  pc = new RTCPeerConnection({ iceServers: ICE });
+  const policy = S.relay ? "relay" : "all";
+  if (S.relay) dbg("Force-relay ON — media will go only through TURN(S).", "warn");
+  pc = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: policy });
 
   pc.ontrack = (e) => {
     dbg("Video track received ✓ (waiting for frames…)", "ok");
