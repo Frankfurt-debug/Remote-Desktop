@@ -221,18 +221,10 @@ function toggleFullscreen() {
 // ---- WebRTC / signaling ---------------------------------------------------
 const ICE = [
   { urls: ["stun:stun.l.google.com:19302"] },
-  // Free public TURN relay so restrictive networks (school/guest Wi-Fi that
-  // block the direct UDP path) can still connect by relaying over TCP/443.
-  // For reliability, replace with your own TURN server / a free Metered account.
-  {
-    urls: [
-      "turn:openrelay.metered.ca:443",
-      "turn:openrelay.metered.ca:443?transport=tcp",
-      "turn:openrelay.metered.ca:80",
-    ],
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
+  // For a restrictive network (school Wi-Fi), add a REAL TURN server here — e.g.
+  // Cloudflare or your own coturn. Do not add a dead public relay; an
+  // unreachable TURN server breaks connections that would otherwise work.
+  // ICE.push({ urls: "turn:turn.example.com:443?transport=tcp", username: "...", credential: "..." });
 ];
 
 function connect() {

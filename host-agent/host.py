@@ -337,23 +337,11 @@ def handle_input(msg: dict) -> None:
 # ----------------------------------------------------------------------------
 def build_ice_servers():
     servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+    # Add a real TURN server only when configured (set TURN_URL/USER/PASS). We
+    # do NOT ship a default public relay — the free ones are dead/unreliable and
+    # adding an unreachable relay actually breaks otherwise-working connections.
     if TURN_URL:
-        # Your own TURN server (most reliable). Set TURN_URL/USER/PASS.
         servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
-    else:
-        # Free public TURN relay (best-effort) so restrictive networks that block
-        # the direct UDP path — like school/guest Wi-Fi — can still connect by
-        # relaying media over TCP/443. For reliability, run your own coturn or a
-        # free Metered account and set TURN_URL/TURN_USER/TURN_PASS instead.
-        servers.append(RTCIceServer(
-            urls=[
-                "turn:openrelay.metered.ca:443",
-                "turn:openrelay.metered.ca:443?transport=tcp",
-                "turn:openrelay.metered.ca:80",
-            ],
-            username="openrelayproject",
-            credential="openrelayproject",
-        ))
     return servers
 
 
