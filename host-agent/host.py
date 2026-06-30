@@ -409,6 +409,19 @@ async def connect_once():
 
             await pc.setLocalDescription(await pc.createOffer())
             await wait_ice_gathering_complete(pc)
+
+            # Print which candidate types the host gathered. For a relay-only
+            # viewer to connect, this MUST include "relay" — otherwise the host
+            # can't allocate on the TURN server (and forced-relay will fail).
+            cand_types = [
+                line.split("typ ", 1)[1].split()[0]
+                for line in pc.localDescription.sdp.splitlines()
+                if "candidate:" in line and "typ " in line
+            ]
+            print("host ICE candidates:", cand_types or ["(none)"])
+            if "relay" not in cand_types:
+                print("  ⚠ NO relay candidate — TURN allocation failed; forced-relay won't connect.")
+
             await ws.send(json.dumps({
                 "type": "offer",
                 "sdp": pc.localDescription.sdp,
