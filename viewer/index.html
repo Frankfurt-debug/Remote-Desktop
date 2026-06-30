@@ -419,8 +419,15 @@ async function pollStats() {
     }
     if (!gotFirstFrame && Date.now() - connectedAt > 8000 && !noFrameWarned) {
       noFrameWarned = true;
-      dbg("Track connected but NO video frames after 8s.", "bad");
-      dbg("→ Signaling works; the media path is blocked. Needs a TURN relay.", "bad");
+      const ice = pc.iceConnectionState, peer = pc.connectionState;
+      dbg(`No video after 8s. ICE=${ice}, Peer=${peer}`, "bad");
+      if (ice === "connected" || ice === "completed") {
+        // Network path is fine — the secure handshake / host side is the problem.
+        dbg("→ Network path is OK, but the secure handshake didn't finish.", "bad");
+        dbg("→ Fully restart the host (close window, run start-host.bat).", "bad");
+      } else {
+        dbg("→ No network path (ICE " + ice + "). This network needs a TURN relay.", "bad");
+      }
     }
 
     let kbps = 0;
