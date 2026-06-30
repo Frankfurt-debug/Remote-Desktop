@@ -58,8 +58,10 @@
   .btn:hover { filter:brightness(1.08); }
   .btn.sec { background:#2a2a32; margin-top:8px; }
   #status { position:fixed; bottom:8px; left:10px; color:#6f6; font-size:12px; z-index:5; opacity:.7; pointer-events:none; }
-  #debug { position:fixed; bottom:30px; left:10px; z-index:7; width:340px; max-height:42vh; overflow:auto;
-           background:rgba(8,8,12,.86); border:1px solid var(--line); border-radius:8px; padding:8px 10px;
+  /* z-index above the overlay (10) so the log stays readable — and un-blurred —
+     even while the settings menu is open. */
+  #debug { position:fixed; bottom:30px; left:10px; z-index:12; width:340px; max-height:42vh; overflow:auto;
+           background:rgba(8,8,12,.94); border:1px solid var(--line); border-radius:8px; padding:8px 10px;
            font:11px/1.45 ui-monospace, Menlo, Consolas, monospace; color:#cdd; display:none; }
   #debug.show { display:block; }
   #debug .ok { color:#6f6; } #debug .bad { color:#ff6b6b; } #debug .warn { color:#ffd479; } #debug .dim { color:#888; }
@@ -73,6 +75,7 @@
     <button class="ui" id="btnSettings">⚙ Settings</button>
     <button class="ui" id="btnFull">⛶ Fullscreen</button>
     <button class="ui" id="btnLock">🖱 Capture mouse</button>
+    <button class="ui" id="btnLog">📋 Log</button>
   </div>
 
   <div id="hud"></div>
@@ -123,6 +126,7 @@
         <h2>Overlay</h2>
         <div class="field"><label for="hudOn">Show stats (top-right)</label><input type="checkbox" id="hudOn"></div>
         <div class="field"><label for="toolbarOn">Show toolbar buttons (top-left)</label><input type="checkbox" id="toolbarOn"></div>
+        <div class="field"><label for="logOn">Show connection log (bottom-left)</label><input type="checkbox" id="logOn"></div>
         <div style="font-size:11px;color:var(--dim);margin-top:4px">Tip: with the toolbar hidden, press <b>Esc</b> to reopen this menu.</div>
       </div>
 
@@ -158,7 +162,7 @@ const sameOrigin = location.host
 const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
-  lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true,
+  lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -173,14 +177,14 @@ function formToS() {
   S.room = $("room").value.trim() || "default";
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
-  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked;
+  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
-  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar;
+  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -221,6 +225,7 @@ function closeSettings() {
   sendConfig();
   hud.style.display = S.hud ? "block" : "none";
   document.body.classList.toggle("hidetoolbar", !S.toolbar);
+  debugEl.classList.toggle("show", S.log);
   overlay.classList.add("hidden");
   settingsOpen = false;
   updateCursorHide();
@@ -231,6 +236,7 @@ $("doneBtn").onclick = closeSettings;
 $("connectBtn").onclick = () => { formToS(); saveSettings(); connect(); };
 $("btnFull").onclick = toggleFullscreen;
 $("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
+$("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
 
 function toggleFullscreen() {
   if (document.fullscreenElement) document.exitFullscreen();
@@ -249,7 +255,7 @@ const ICE = [
 let gotFirstFrame = false, candCounts = { host: 0, srflx: 0, relay: 0 };
 
 function connect() {
-  debugEl.innerHTML = ""; debugEl.classList.add("show");
+  debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
