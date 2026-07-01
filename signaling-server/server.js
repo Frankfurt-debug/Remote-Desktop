@@ -53,7 +53,17 @@ wss.on("connection", (ws) => {
   ws.role = null;
   ws.room = null;
 
-  ws.on("message", (data) => {
+  ws.on("message", (data, isBinary) => {
+    // Binary messages are video frames (WebSocket streaming mode) or other raw
+    // payloads — relay them straight to the other peer without parsing.
+    if (isBinary) {
+      const room = rooms.get(ws.room);
+      if (!room) return;
+      const target = ws.role === "host" ? room.viewer : room.host;
+      if (target && target.readyState === 1) target.send(data, { binary: true });
+      return;
+    }
+
     let msg;
     try {
       msg = JSON.parse(data);

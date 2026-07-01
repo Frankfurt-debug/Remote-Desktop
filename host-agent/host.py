@@ -28,11 +28,14 @@ Notes:
 import asyncio
 import ctypes
 import fractions
+import io
 import json
 import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+
+from PIL import Image
 
 import mss
 import numpy as np
@@ -378,6 +381,45 @@ async def connect_once():
 
         pc = None
 
+        # --- WebSocket video streaming (fallback for networks that block WebRTC) ---
+        # Instead of WebRTC/DTLS, capture -> JPEG -> send as binary over the same
+        # signaling socket the viewer already uses. Slower/heavier than WebRTC but
+        # rides the one channel a strict filter reliably allows.
+        stream_state = {"run": False, "fps": 12, "scale": 0.5, "quality": 55, "cursor": True}
+        stream_task = None
+
+        async def ws_stream():
+            loop = asyncio.get_event_loop()
+            last = None
+            print("WS video stream: started")
+            frames = 0
+            while stream_state["run"]:
+                t0 = time.time()
+                try:
+                    arr, ml, mt = await loop.run_in_executor(None, _grab, MONITOR)
+                    if stream_state["cursor"]:
+                        draw_cursor(arr, ml, mt)
+                    img = Image.fromarray(arr)
+                    scale = float(stream_state["scale"])
+                    if scale < 0.999:
+                        img = img.resize((max(2, int(img.width * scale)),
+                                          max(2, int(img.height * scale))))
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=int(stream_state["quality"]))
+                    data = buf.getvalue()
+                    if data != last:            # skip unchanged frames to save bandwidth
+                        await ws.send(data)
+                        last = data
+                        frames += 1
+                except Exception as e:
+                    print("stream error:", e)
+                    await asyncio.sleep(0.3)
+                interval = 1.0 / max(1, int(stream_state["fps"]))
+                dt = time.time() - t0
+                if dt < interval:
+                    await asyncio.sleep(interval - dt)
+            print(f"WS video stream: stopped ({frames} frames sent)")
+
         async def new_peer_connection():
             nonlocal pc
             if pc is not None:
@@ -463,20 +505,50 @@ async def connect_once():
                     except Exception as e:
                         print("ice add error:", e)
 
+            elif mtype == "start-stream":
+                # Viewer wants WebSocket video (no WebRTC). Drop any WebRTC peer
+                # so we don't capture the screen twice.
+                if pc:
+                    await pc.close()
+                    pc = None
+                for k in ("fps", "scale", "quality", "cursor"):
+                    if k in msg:
+                        stream_state[k] = msg[k]
+                stream_state["run"] = True
+                print(f"start-stream: fps={stream_state['fps']} scale={stream_state['scale']} q={stream_state['quality']}")
+                if stream_task is None or stream_task.done():
+                    stream_task = asyncio.create_task(ws_stream())
+
+            elif mtype == "stop-stream":
+                stream_state["run"] = False
+
+            elif mtype in ("mousemove", "mousemoverel", "mousedown", "mouseup",
+                           "wheel", "keydown", "keyup"):
+                # Input in WebSocket-streaming mode arrives here (no data channel).
+                handle_input(msg)
+
+            elif mtype == "config" and stream_state["run"]:
+                for k in ("fps", "scale", "quality", "cursor"):
+                    if k in msg:
+                        stream_state[k] = msg[k]
+
             elif mtype == "leave":
                 # Explicit "I'm leaving" from the viewer (button / page close).
                 # Always tear down cleanly so the next connection starts fresh.
                 print("viewer left (explicit)")
+                stream_state["run"] = False
                 if pc:
                     await pc.close()
                     pc = None
 
             elif mtype == "peer-left":
-                # The signaling WebSocket is only needed for the handshake. Once
-                # the media is connected it flows independently (peer-to-peer /
-                # via the relay), so a dropped signaling socket must NOT tear the
-                # video down — otherwise a flaky/filtered network kills a working
-                # stream. Only clean up if the media never actually connected.
+                # WS-video rides this socket, so it can't survive the viewer
+                # leaving — stop streaming (it restarts when they reconnect).
+                stream_state["run"] = False
+                # For WebRTC, the media is independent of signaling, so a dropped
+                # socket must NOT tear a connected stream down (flaky/filtered
+                # networks would kill a working stream). Only clean up if it
+                # never actually connected.
                 if pc and pc.connectionState == "connected":
                     print("viewer signaling dropped — media still connected, keeping it alive")
                 else:

@@ -8,14 +8,14 @@
   :root { --accent:#2d7dff; --bg:#0c0c0e; --panel:#16161a; --line:#2a2a32; --txt:#e8e8ea; --dim:#9a9aa4; }
   html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:system-ui, sans-serif; color:var(--txt); }
   #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
-  video { max-width:100%; max-height:100%; display:block; background:#000; }
-  video.fill { width:100%; height:100%; object-fit:fill; }
-  video.contain { width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; }
+  video, canvas { max-width:100%; max-height:100%; display:block; background:#000; }
+  video.fill, canvas.fill { width:100%; height:100%; object-fit:fill; }
+  video.contain, canvas.contain { width:auto; height:auto; max-width:100%; max-height:100%; object-fit:contain; }
 
   /* While streaming, hide the local cursor so only the host-drawn one shows
      (fixes seeing two cursors / the mouse over a fullscreen game). Buttons
      re-enable a pointer so the toolbar stays usable. */
-  body.nocursor, body.nocursor video, body.nocursor #stage { cursor:none; }
+  body.nocursor, body.nocursor video, body.nocursor canvas, body.nocursor #stage { cursor:none; }
   body.nocursor .ui { cursor:pointer; }
 
   /* Toolbar (top-left) */
@@ -69,7 +69,10 @@
 </style>
 </head>
 <body>
-  <div id="stage"><video id="video" autoplay playsinline></video></div>
+  <div id="stage">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas" style="display:none"></canvas>
+  </div>
 
   <div id="toolbar">
     <button class="ui" id="btnSettings">⚙ Settings</button>
@@ -94,7 +97,13 @@
         <input type="text" id="server" />
         <label class="full" style="font-size:13px;color:#d6d6da;margin-top:8px">Room</label>
         <input type="text" id="room" />
-        <div class="field" style="margin-top:10px"><label for="relayOn">Force relay (school / blocked networks)</label><input type="checkbox" id="relayOn"></div>
+        <div class="field" style="margin-top:10px"><label for="mode">Connection mode</label>
+          <select id="mode">
+            <option value="webrtc">WebRTC (fast — same network)</option>
+            <option value="wsvideo">WebSocket (works through filters)</option>
+          </select></div>
+        <div class="field"><label for="relayOn">Force relay (WebRTC only)</label><input type="checkbox" id="relayOn"></div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px">School Chromebook blocked? Use <b>WebSocket</b> mode.</div>
       </div>
 
       <div class="grp">
@@ -143,7 +152,11 @@
 const BAKED_URL = "wss://remote-desktop-signaling.onrender.com";   // <-- your Render server
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
-const video = $("video"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
+const video = $("video"), canvas = $("canvas"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
+const ctx = canvas.getContext("2d");
+// The element currently showing the remote screen (video for WebRTC, canvas for
+// WebSocket mode) — used for pointer lock and coordinate mapping.
+const displayEl = () => (S.mode === "wsvideo" ? canvas : video);
 
 // ---- Diagnostics log ------------------------------------------------------
 // Shows each connection step so we can see exactly where it gets stuck:
@@ -166,6 +179,7 @@ const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
+  mode: "webrtc", quality: 55,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -182,6 +196,7 @@ function formToS() {
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
   S.relay = $("relayOn").checked;
+  S.mode = $("mode").value;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
@@ -190,6 +205,7 @@ function sToForm() {
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
   $("relayOn").checked = S.relay;
+  $("mode").value = S.mode;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -200,14 +216,21 @@ let ws, pc, inputChannel, connected = false, settingsOpen = true;
 
 function setStatus(s) { statusEl.textContent = s; }
 function wsSend(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
-function sendInput(o) { if (inputChannel && inputChannel.readyState === "open" && !settingsOpen) inputChannel.send(JSON.stringify(o)); }
+function sendInput(o) {
+  if (settingsOpen) return;
+  // WebSocket mode: input rides the signaling socket. WebRTC mode: the data channel.
+  if (S.mode === "wsvideo") wsSend(o);
+  else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(o));
+}
 function sendConfig() {
-  if (inputChannel && inputChannel.readyState === "open")
-    inputChannel.send(JSON.stringify({ type: "config", fps: S.fps, scale: S.scale, cursor: S.cursor }));
+  const cfg = { type: "config", fps: S.fps, scale: S.scale, cursor: S.cursor, quality: S.quality };
+  if (S.mode === "wsvideo") wsSend(cfg);
+  else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(cfg));
 }
 
 function applyVideoStyle() {
-  video.className = S.fit;          // 'contain' or 'fill'
+  video.className = S.fit;
+  canvas.className = S.fit;
 }
 function updateCursorHide() {
   document.body.classList.toggle("nocursor", connected && !settingsOpen);
@@ -349,26 +372,64 @@ function connect() {
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
-  dbg("Opening WebSocket: " + S.server);
+  dbg("Opening WebSocket: " + S.server + (S.mode === "wsvideo" ? "  [WebSocket video mode]" : ""));
   ws = new WebSocket(S.server);
+  ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     dbg("WebSocket OPEN ✓ — signaling reachable", "ok");
     wsSend({ type: "register", role: "viewer", room: S.room });
     dbg("Registered as viewer (room: " + S.room + ")");
     setStatus("waiting for host… (free server can take ~50s to wake)");
+    if (S.mode === "wsvideo") requestStream();
     // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and
     // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
     ws._ka = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "keepalive" }); }, 15000);
   };
   ws.onmessage = async (ev) => {
+    // Binary payload = a JPEG video frame (WebSocket streaming mode).
+    if (ev.data instanceof ArrayBuffer) { renderFrame(ev.data); return; }
     const m = JSON.parse(ev.data);
-    if (m.type === "offer") { dbg("Offer received from host ✓", "ok"); await handleOffer(m); }
-    else if (m.type === "host-ready") { dbg("Host is ready"); setStatus("host ready, negotiating…"); }
+    if (m.type === "offer") {
+      if (S.mode === "wsvideo") return;   // ignore WebRTC in WebSocket mode
+      dbg("Offer received from host ✓", "ok"); await handleOffer(m);
+    }
+    else if (m.type === "host-ready") { dbg("Host is ready"); if (S.mode === "wsvideo") requestStream(); }
     else if (m.type === "peer-left") { dbg("Host left", "warn"); setStatus("host disconnected"); teardown(); }
   };
   ws.onclose = () => { clearInterval(ws._ka); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
   ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
+}
+
+// ---- WebSocket video mode -------------------------------------------------
+function requestStream() {
+  dbg("Requesting WebSocket video stream…");
+  wsSend({ type: "start-stream", fps: S.fps, scale: S.scale, quality: S.quality, cursor: S.cursor });
+}
+
+let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0;
+async function renderFrame(buf) {
+  try {
+    const bmp = await createImageBitmap(new Blob([buf], { type: "image/jpeg" }));
+    if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+      canvas.width = bmp.width; canvas.height = bmp.height;
+    }
+    ctx.drawImage(bmp, 0, 0);
+    bmp.close();
+    frameCount++; fpsWin++;
+    const now = performance.now();
+    if (now - fpsWinT > 1000) { fpsShown = Math.round(fpsWin * 1000 / (now - fpsWinT)); fpsWin = 0; fpsWinT = now; }
+    if (!connected) {
+      connected = true;
+      video.style.display = "none";
+      canvas.style.display = "block";
+      document.body.classList.add("streaming");
+      applyVideoStyle();
+      dbg("First frame received ✓ — WebSocket video is LIVE 🎉", "ok");
+      closeSettings();
+      setStatus("");
+    }
+  } catch {}
 }
 
 async function handleOffer(m) {
@@ -380,6 +441,7 @@ async function handleOffer(m) {
   pc.ontrack = (e) => {
     dbg("Video track received ✓ (waiting for frames…)", "ok");
     video.srcObject = e.streams[0];
+    video.style.display = "block"; canvas.style.display = "none";
     connected = true;
     document.body.classList.add("streaming");
     applyVideoStyle();
@@ -435,27 +497,30 @@ function waitIceComplete(pc) {
 }
 
 function teardown() {
+  if (S.mode === "wsvideo") { try { wsSend({ type: "stop-stream" }); } catch {} }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   inputChannel = null; connected = false;
   video.srcObject = null;
+  video.style.display = ""; canvas.style.display = "none";
   document.body.classList.remove("streaming");
   hud.style.display = "none";
   openSettings();
 }
 
-// ---- Input capture --------------------------------------------------------
-const locked = () => document.pointerLockElement === video;
-
-video.addEventListener("click", () => { if (S.lock && !locked() && !settingsOpen) video.requestPointerLock(); });
+// ---- Input capture (works for both video and canvas) ----------------------
+const locked = () => document.pointerLockElement === displayEl();
+const lockClick = () => { if (S.lock && connected && !locked() && !settingsOpen) displayEl().requestPointerLock(); };
+video.addEventListener("click", lockClick);
+canvas.addEventListener("click", lockClick);
 
 let accDx = 0, accDy = 0, pendingAbs = null;
 document.addEventListener("mousemove", (e) => {
-  if (!inputChannel || settingsOpen) return;
+  if (!connected || settingsOpen) return;
   if (locked()) {
     if (S.smooth) { accDx += e.movementX; accDy += e.movementY; }
     else sendInput({ type: "mousemoverel", dx: Math.round(e.movementX * S.sens), dy: Math.round(e.movementY * S.sens) });
   } else {
-    const r = video.getBoundingClientRect();
+    const r = displayEl().getBoundingClientRect();
     if (!r.width || !r.height) return;
     const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
     if (x >= 0 && x <= 1 && y >= 0 && y <= 1) {
@@ -465,7 +530,7 @@ document.addEventListener("mousemove", (e) => {
   }
 });
 function flushMouse() {
-  if (inputChannel && inputChannel.readyState === "open" && !settingsOpen) {
+  if (connected && !settingsOpen) {
     if (locked()) {
       if (accDx || accDy) { sendInput({ type: "mousemoverel", dx: Math.round(accDx * S.sens), dy: Math.round(accDy * S.sens) }); accDx = accDy = 0; }
     } else if (pendingAbs) { sendInput({ type: "mousemove", x: pendingAbs.x, y: pendingAbs.y }); pendingAbs = null; }
@@ -506,7 +571,13 @@ document.addEventListener("keyup", (e) => {
 // ---- Stats HUD + media diagnostics ----------------------------------------
 let lastBytes = 0, lastTs = 0, connectedAt = 0, noFrameWarned = false;
 async function pollStats() {
-  if (!pc || !connected) return;
+  if (!connected) return;
+  if (S.mode === "wsvideo") {          // WebSocket mode has no pc — show frame stats
+    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>FPS <b>${fpsShown}</b><br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
+      (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
+    return;
+  }
+  if (!pc) return;
   if (!connectedAt) connectedAt = Date.now();
   try {
     const stats = await pc.getStats();
