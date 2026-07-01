@@ -422,6 +422,11 @@ async def connect_once():
 
         async def new_peer_connection():
             nonlocal pc
+            # Give a WebSocket-mode viewer a moment to send "start-stream" first;
+            # if it does, skip WebRTC entirely.
+            await asyncio.sleep(0.4)
+            if stream_state["run"]:
+                return
             if pc is not None:
                 await pc.close()
             pc = RTCPeerConnection(RTCConfiguration(iceServers=build_ice_servers()))
@@ -480,8 +485,10 @@ async def connect_once():
             mtype = msg.get("type")
 
             if mtype == "viewer-joined":
-                print("viewer joined -> creating offer")
-                await new_peer_connection()
+                print("viewer joined")
+                # Run concurrently so a slow WebRTC ICE gather can't block the
+                # loop from handling a WebSocket-mode viewer's start-stream.
+                asyncio.create_task(new_peer_connection())
 
             elif mtype == "answer":
                 if pc:
