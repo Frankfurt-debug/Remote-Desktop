@@ -58,6 +58,10 @@ SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
 ROOM = os.environ.get("ROOM", "default")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
+# Cap the WebRTC send bitrate. Over a bandwidth-limited relay an uncapped
+# encoder overruns the link, frames queue, and latency grows unbounded (mouse
+# lags ~1s). ~2.5 Mbps keeps it responsive; lower it if the relay is slow.
+MAX_BITRATE_KBPS = int(os.environ.get("MAX_BITRATE_KBPS", "2500"))
 
 TURN_URL = os.environ.get("TURN_URL")           # e.g. turn:turn.example.com:3478
 TURN_USER = os.environ.get("TURN_USER")
@@ -361,6 +365,21 @@ def build_ice_servers():
     return servers
 
 
+def cap_video_bitrate(sdp: str, kbps: int) -> str:
+    """Add a bandwidth line to the video section. aiortc honours the bandwidth in
+    the remote description as its encoder cap, which stops the send queue from
+    growing (the cause of latency creeping up over a slow relay)."""
+    out, in_video = [], False
+    for line in sdp.replace("\r\n", "\n").split("\n"):
+        if line.startswith("m="):
+            in_video = line.startswith("m=video")
+        out.append(line)
+        if in_video and line.startswith("c="):
+            out.append(f"b=AS:{kbps}")
+            in_video = False
+    return "\r\n".join(out)
+
+
 async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
@@ -492,10 +511,11 @@ async def connect_once():
 
             elif mtype == "answer":
                 if pc:
+                    sdp = cap_video_bitrate(msg["sdp"], MAX_BITRATE_KBPS)
                     await pc.setRemoteDescription(
-                        RTCSessionDescription(sdp=msg["sdp"], type="answer")
+                        RTCSessionDescription(sdp=sdp, type="answer")
                     )
-                    print("answer applied")
+                    print(f"answer applied (bitrate cap {MAX_BITRATE_KBPS} kbps)")
 
             elif mtype == "ice":
                 # Trickled ICE candidate from the viewer.
