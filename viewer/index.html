@@ -143,6 +143,7 @@
 
       <button class="btn" id="connectBtn">Connect</button>
       <button class="btn sec" id="testBtn">🔍 Test what's blocked</button>
+      <button class="btn sec" id="webrtcTestBtn">🔬 Test WebRTC (see how it's blocked)</button>
       <button class="btn sec" id="doneBtn" style="display:none">Resume</button>
       <div class="hint" id="hint">After connecting, click the screen (or “Capture mouse”) to play games with Pointer Lock. Press <b>Esc</b> to release and reopen this panel.</div>
     </div>
@@ -242,6 +243,7 @@ function openSettings() {
   if (document.pointerLockElement) document.exitPointerLock();
   $("connectBtn").style.display = connected ? "none" : "block";
   $("testBtn").style.display = connected ? "none" : "block";
+  $("webrtcTestBtn").style.display = connected ? "none" : "block";
   $("doneBtn").style.display = connected ? "block" : "none";
   $("panelSub").textContent = connected ? "Adjust settings live." : "Configure, then connect.";
   sToForm();
@@ -264,6 +266,51 @@ $("btnSettings").onclick = openSettings;
 $("doneBtn").onclick = closeSettings;
 $("connectBtn").onclick = () => { formToS(); saveSettings(); connect(); };
 $("testBtn").onclick = () => { formToS(); saveSettings(); networkTest(); };
+$("webrtcTestBtn").onclick = () => { formToS(); saveSettings(); testWebRTC(); };
+
+// Runs a REAL WebRTC handshake with the host and reports exactly which layer
+// fails, so you can see whether it's ICE (needs a relay) or DTLS media (a
+// filter) — and understand why a different signaling URL won't change it.
+function testWebRTC() {
+  debugEl.innerHTML = ""; debugEl.classList.add("show");
+  dbg("=== WebRTC BLOCK TEST (host must be running) ===");
+  const tws = new WebSocket(S.server); tws.binaryType = "arraybuffer";
+  let tpc = null, ice = "-", peer = "-", done = false;
+  const finish = () => {
+    if (done) return; done = true;
+    dbg("— WEBRTC VERDICT —");
+    if (peer === "connected") {
+      dbg("WebRTC CONNECTS here ✓ — use WebRTC mode, it's much faster than WS.", "ok");
+    } else if (ice === "connected" || ice === "completed") {
+      dbg("ICE connected but media (DTLS) is BLOCKED — deep-packet filtering.", "bad");
+      dbg("→ A different signaling URL will NOT help: the video never travels", "warn");
+      dbg("  through the signaling server. Only a relay (TURNS/443) or WS mode helps.", "warn");
+    } else {
+      dbg("ICE never connected (" + ice + ") — no usable network path / relay.", "bad");
+      dbg("→ Needs a working TURN relay; a different signaling URL won't fix this.", "warn");
+    }
+    try { tws.send(JSON.stringify({ type: "leave" })); } catch {}
+    try { tpc && tpc.close(); } catch {}
+    try { tws.close(); } catch {}
+  };
+  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room: S.room })); };
+  tws.onerror = () => { dbg("Signaling: BLOCKED ✗", "bad"); finish(); };
+  tws.onmessage = async (ev) => {
+    if (ev.data instanceof ArrayBuffer) return;
+    const m = JSON.parse(ev.data);
+    if (m.type !== "offer") return;
+    dbg("Offer received ✓ (signaling + handshake work)", "ok");
+    tpc = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: S.relay ? "relay" : "all" });
+    tpc.oniceconnectionstatechange = () => { ice = tpc.iceConnectionState; dbg("ICE: " + ice, (ice === "connected" || ice === "completed") ? "ok" : (ice === "failed" ? "bad" : "dim")); };
+    tpc.onconnectionstatechange = () => { peer = tpc.connectionState; dbg("Peer: " + peer, peer === "connected" ? "ok" : (peer === "failed" ? "bad" : "dim")); if (peer === "connected" || peer === "failed") setTimeout(finish, 500); };
+    tpc.onicecandidate = (e) => { if (e.candidate) tws.send(JSON.stringify({ type: "ice", candidate: { candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex } })); };
+    await tpc.setRemoteDescription({ type: "offer", sdp: m.sdp });
+    await tpc.setLocalDescription(await tpc.createAnswer());
+    tws.send(JSON.stringify({ type: "answer", sdp: tpc.localDescription.sdp }));
+    dbg("Answer sent → testing media handshake (DTLS)…");
+  };
+  setTimeout(finish, 15000);
+}
 $("btnFull").onclick = toggleFullscreen;
 $("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
 $("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
@@ -385,19 +432,23 @@ function connect() {
     // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
     ws._ka = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "keepalive" }); }, 15000);
+    // Latency probe every 2s (round-trip through the server to the host).
+    clearInterval(ws._ping);
+    ws._ping = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "ping", t: performance.now() }); }, 2000);
   };
   ws.onmessage = async (ev) => {
     // Binary payload = a JPEG video frame (WebSocket streaming mode).
     if (ev.data instanceof ArrayBuffer) { renderFrame(ev.data); return; }
     const m = JSON.parse(ev.data);
-    if (m.type === "offer") {
+    if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); }
+    else if (m.type === "offer") {
       if (S.mode === "wsvideo") return;   // ignore WebRTC in WebSocket mode
       dbg("Offer received from host ✓", "ok"); await handleOffer(m);
     }
     else if (m.type === "host-ready") { dbg("Host is ready"); if (S.mode === "wsvideo") requestStream(); }
     else if (m.type === "peer-left") { dbg("Host left", "warn"); setStatus("host disconnected"); teardown(); }
   };
-  ws.onclose = () => { clearInterval(ws._ka); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
+  ws.onclose = () => { clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
   ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
 }
 
@@ -407,7 +458,7 @@ function requestStream() {
   wsSend({ type: "start-stream", fps: S.fps, scale: S.scale, quality: S.quality, cursor: S.cursor });
 }
 
-let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0;
+let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0, wsPing = null;
 async function renderFrame(buf) {
   try {
     const bmp = await createImageBitmap(new Blob([buf], { type: "image/jpeg" }));
@@ -573,7 +624,7 @@ let lastBytes = 0, lastTs = 0, connectedAt = 0, noFrameWarned = false;
 async function pollStats() {
   if (!connected) return;
   if (S.mode === "wsvideo") {          // WebSocket mode has no pc — show frame stats
-    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>FPS <b>${fpsShown}</b><br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
+    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b><br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
       (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     return;
   }

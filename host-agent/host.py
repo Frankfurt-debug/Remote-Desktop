@@ -529,6 +529,10 @@ async def connect_once():
             elif mtype == "stop-stream":
                 stream_state["run"] = False
 
+            elif mtype == "ping":
+                # Latency probe: echo the viewer's timestamp straight back.
+                await ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
+
             elif mtype in ("mousemove", "mousemoverel", "mousedown", "mouseup",
                            "wheel", "keydown", "keyup"):
                 # Input in WebSocket-streaming mode arrives here (no data channel).
