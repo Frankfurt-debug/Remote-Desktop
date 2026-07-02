@@ -214,6 +214,20 @@ sToForm();
 
 // ---- Connection state -----------------------------------------------------
 let ws, pc, inputChannel, connected = false, settingsOpen = true;
+let wantConnected = false, reconnectTimer = null;
+
+// Auto-recover from a dropped connection (flaky relay) instead of dumping the
+// user back to the menu. Keeps retrying until they hit Leave.
+function scheduleReconnect() {
+  if (!wantConnected) { teardown(); return; }
+  if (reconnectTimer) return;
+  setStatus("⚠ connection lost — reconnecting…");
+  dbg("Connection lost — auto-reconnecting in 2s…", "warn");
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  inputChannel = null; connected = false;
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; if (wantConnected) connect(); }, 2000);
+}
 
 function setStatus(s) { statusEl.textContent = s; }
 function wsSend(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
@@ -320,6 +334,8 @@ $("btnLeave").onclick = leave;
 // the host keeps the stream alive to survive flaky signaling, which would block
 // the next reconnect). Also fired automatically when the page is closed/hidden.
 function leave() {
+  wantConnected = false;
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   try { wsSend({ type: "leave" }); } catch {}
   if (ws) { try { ws.close(); } catch {} ws = null; }
   teardown();
@@ -415,6 +431,7 @@ async function networkTest() {
 }
 
 function connect() {
+  wantConnected = true;
   debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
@@ -446,7 +463,12 @@ function connect() {
       dbg("Offer received from host ✓", "ok"); await handleOffer(m);
     }
     else if (m.type === "host-ready") { dbg("Host is ready"); if (S.mode === "wsvideo") requestStream(); }
-    else if (m.type === "peer-left") { dbg("Host left", "warn"); setStatus("host disconnected"); teardown(); }
+    else if (m.type === "peer-left") {
+      dbg("Host signaling dropped", "warn");
+      // If media is still flowing, keep it (WebRTC is independent of signaling).
+      // Otherwise try to reconnect (e.g. the host restarted).
+      if (!connected) scheduleReconnect();
+    }
   };
   ws.onclose = () => { clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
   ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
@@ -527,7 +549,7 @@ async function handleOffer(m) {
     dbg("Peer: " + st, st === "connected" ? "ok" : (st === "failed" ? "bad" : "dim"));
     if (st === "disconnected") setStatus("⚠ connection unstable, recovering…");
     else if (st === "connected") setStatus("");
-    else if (st === "failed" || st === "closed") { setStatus("connection lost"); teardown(); }
+    else if (st === "failed" || st === "closed") scheduleReconnect();
   };
 
   await pc.setRemoteDescription({ type: "offer", sdp: m.sdp });
@@ -633,14 +655,21 @@ async function pollStats() {
   try {
     const stats = await pc.getStats();
     let fps = "–", w = 0, h = 0, rtt = null, bytes = 0, ts = 0, frames = 0;
+    let localId = null; const cands = {};
     stats.forEach((r) => {
       if (r.type === "inbound-rtp" && r.kind === "video") {
         if (r.framesPerSecond != null) fps = Math.round(r.framesPerSecond);
         w = r.frameWidth || w; h = r.frameHeight || h;
         bytes = r.bytesReceived || 0; ts = r.timestamp || 0; frames = r.framesDecoded || 0;
       }
-      if (r.type === "candidate-pair" && r.nominated && r.currentRoundTripTime != null) rtt = r.currentRoundTripTime;
+      if (r.type === "candidate-pair" && (r.nominated || r.selected) && r.currentRoundTripTime != null) {
+        rtt = r.currentRoundTripTime; localId = r.localCandidateId;
+      }
+      if (r.type === "local-candidate") cands[r.id] = r.candidateType;
     });
+    // Which path is the media actually on? relay = via TURN, host/srflx = direct.
+    const t = localId ? cands[localId] : null;
+    const route = t === "relay" ? "TURN relay" : t === "srflx" ? "direct (STUN)" : t === "host" ? "direct (LAN)" : "…";
 
     // The key diagnostic: are video frames actually arriving?
     if (bytes > 0 && !gotFirstFrame) {
@@ -672,7 +701,8 @@ async function pollStats() {
     if (S.hud) {
       hud.innerHTML =
         `FPS <b>${fps}</b><br>Ping <b>${ping}</b><br>` +
-        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>Frames <b>${frames}</b>` +
+        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>Frames <b>${frames}</b><br>` +
+        `Route <b>${route}</b>` +
         (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     }
   } catch {}
