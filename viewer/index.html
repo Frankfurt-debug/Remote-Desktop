@@ -447,6 +447,7 @@ async function networkTest() {
 function connect() {
   wantConnected = true;
   curFps = S.fps; curScale = S.scale; mediaPing = null;
+  lagHist = []; baseLag = curLag = null;
   debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
@@ -464,9 +465,11 @@ function connect() {
     // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
     ws._ka = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "keepalive" }); }, 15000);
-    // Latency probe every 2s (round-trip through the server to the host).
+    // Latency probe (round-trip through the server to the host). Frequent so it
+    // catches buffer buildup — the ping rides the same path as the video, so it
+    // climbs when frames queue up, and drops when the queue drains.
     clearInterval(ws._ping);
-    ws._ping = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "ping", t: performance.now() }); }, 2000);
+    ws._ping = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "ping", t: performance.now() }); }, 600);
   };
   ws.onmessage = async (ev) => {
     // Binary payload = a video frame: JPEG (wsvideo) or H.264 access unit (gpu).
@@ -475,7 +478,7 @@ function connect() {
       return;
     }
     const m = JSON.parse(ev.data);
-    if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); }
+    if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
     else if (m.type === "codec-info") { setupDecoder(m.codec); }
     else if (m.type === "offer") {
       if (isWs()) return;   // ignore WebRTC in WebSocket modes
@@ -545,6 +548,23 @@ function drawVideoFrame(frame) {
 }
 
 let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0, wsPing = null;
+
+// Input-lag tracker: the gap between the current ping and the recent minimum is
+// the buffer buildup — it climbs when frames queue and drops when they drain.
+let lagHist = [], baseLag = null, curLag = null;
+function recordLag(p) {
+  if (p == null) return;
+  curLag = p;
+  lagHist.push(p);
+  if (lagHist.length > 40) lagHist.shift();
+  baseLag = Math.min.apply(null, lagHist);
+}
+function lagLines() {
+  if (curLag == null) return "";
+  const b = baseLag != null ? Math.max(0, curLag - baseLag) : 0;
+  const col = b > 80 ? "#ff6b6b" : b > 30 ? "#ffd479" : "#8f8";
+  return `<br>Input lag <b>${curLag} ms</b><br>Buildup <b style="color:${col}">+${b} ms</b>`;
+}
 async function renderFrame(buf) {
   try {
     const bmp = await createImageBitmap(new Blob([buf], { type: "image/jpeg" }));
@@ -745,7 +765,7 @@ async function pollStats() {
   if (isWs()) {                        // WebSocket modes have no pc — show frame stats
     mediaPing = wsPing;
     adaptQuality();
-    if (S.hud) hud.innerHTML = `Mode <b>${S.mode === "gpu" ? "GPU H.264" : "JPEG"}</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
+    if (S.hud) hud.innerHTML = `Mode <b>${S.mode === "gpu" ? "GPU H.264" : "JPEG"}</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b>` + lagLines() +
       (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     return;
   }
@@ -796,14 +816,14 @@ async function pollStats() {
     let kbps = 0;
     if (lastTs && ts > lastTs) kbps = Math.round((bytes - lastBytes) * 8 / (ts - lastTs));
     lastBytes = bytes; lastTs = ts;
-    if (rtt != null) mediaPing = Math.round(rtt * 1000);
+    if (rtt != null) { mediaPing = Math.round(rtt * 1000); recordLag(mediaPing); }
     adaptQuality();
     const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
     if (S.hud) {
       hud.innerHTML =
         `FPS <b>${fps}</b><br>Ping <b>${ping}</b><br>` +
-        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>Frames <b>${frames}</b><br>` +
-        `Route <b>${route}</b>` +
+        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>` +
+        `Route <b>${route}</b>` + lagLines() +
         (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     }
   } catch {}
