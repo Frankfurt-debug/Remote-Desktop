@@ -89,6 +89,10 @@ VIDEO_CLOCK_RATE = 90000
 # games read directly, so the camera keeps turning past the edge.
 # ----------------------------------------------------------------------------
 MOUSEEVENTF_MOVE = 0x0001
+INPUT_KEYBOARD = 1
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_SCANCODE = 0x0008
 PUL = ctypes.POINTER(ctypes.c_ulong)
 
 
@@ -103,8 +107,18 @@ class _MOUSEINPUT(ctypes.Structure):
     ]
 
 
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", ctypes.c_ushort),
+        ("wScan", ctypes.c_ushort),
+        ("dwFlags", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("dwExtraInfo", PUL),
+    ]
+
+
 class _INPUTUNION(ctypes.Union):
-    _fields_ = [("mi", _MOUSEINPUT)]
+    _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT)]
 
 
 class _INPUT(ctypes.Structure):
@@ -114,7 +128,53 @@ class _INPUT(ctypes.Structure):
 def send_mouse_move_rel(dx: int, dy: int) -> None:
     extra = ctypes.c_ulong(0)
     mi = _MOUSEINPUT(dx, dy, 0, MOUSEEVENTF_MOVE, 0, ctypes.pointer(extra))
-    inp = _INPUT(0, _INPUTUNION(mi))
+    inp = _INPUT(0, _INPUTUNION(mi=mi))
+    ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+# Hardware scancodes (Set 1) keyed by browser KeyboardEvent.code. Games that use
+# DirectInput / raw input read scancodes, not the virtual keys pyautogui sends —
+# so this "game input" path is what makes movement work in HL2, etc.
+# Value is (scancode, is_extended).
+SCANCODES = {
+    "Escape": (0x01, False), "Digit1": (0x02, False), "Digit2": (0x03, False),
+    "Digit3": (0x04, False), "Digit4": (0x05, False), "Digit5": (0x06, False),
+    "Digit6": (0x07, False), "Digit7": (0x08, False), "Digit8": (0x09, False),
+    "Digit9": (0x0A, False), "Digit0": (0x0B, False), "Minus": (0x0C, False),
+    "Equal": (0x0D, False), "Backspace": (0x0E, False), "Tab": (0x0F, False),
+    "KeyQ": (0x10, False), "KeyW": (0x11, False), "KeyE": (0x12, False),
+    "KeyR": (0x13, False), "KeyT": (0x14, False), "KeyY": (0x15, False),
+    "KeyU": (0x16, False), "KeyI": (0x17, False), "KeyO": (0x18, False),
+    "KeyP": (0x19, False), "BracketLeft": (0x1A, False), "BracketRight": (0x1B, False),
+    "Enter": (0x1C, False), "ControlLeft": (0x1D, False), "KeyA": (0x1E, False),
+    "KeyS": (0x1F, False), "KeyD": (0x20, False), "KeyF": (0x21, False),
+    "KeyG": (0x22, False), "KeyH": (0x23, False), "KeyJ": (0x24, False),
+    "KeyK": (0x25, False), "KeyL": (0x26, False), "Semicolon": (0x27, False),
+    "Quote": (0x28, False), "Backquote": (0x29, False), "ShiftLeft": (0x2A, False),
+    "Backslash": (0x2B, False), "KeyZ": (0x2C, False), "KeyX": (0x2D, False),
+    "KeyC": (0x2E, False), "KeyV": (0x2F, False), "KeyB": (0x30, False),
+    "KeyN": (0x31, False), "KeyM": (0x32, False), "Comma": (0x33, False),
+    "Period": (0x34, False), "Slash": (0x35, False), "ShiftRight": (0x36, False),
+    "AltLeft": (0x38, False), "Space": (0x39, False), "CapsLock": (0x3A, False),
+    "F1": (0x3B, False), "F2": (0x3C, False), "F3": (0x3D, False), "F4": (0x3E, False),
+    "F5": (0x3F, False), "F6": (0x40, False), "F7": (0x41, False), "F8": (0x42, False),
+    "F9": (0x43, False), "F10": (0x44, False), "F11": (0x57, False), "F12": (0x58, False),
+    # Extended keys (need the extended flag).
+    "ControlRight": (0x1D, True), "AltRight": (0x38, True), "MetaLeft": (0x5B, True),
+    "MetaRight": (0x5C, True), "ArrowUp": (0x48, True), "ArrowLeft": (0x4B, True),
+    "ArrowRight": (0x4D, True), "ArrowDown": (0x50, True), "Home": (0x47, True),
+    "End": (0x4F, True), "PageUp": (0x49, True), "PageDown": (0x51, True),
+    "Insert": (0x52, True), "Delete": (0x53, True), "NumpadEnter": (0x1C, True),
+}
+
+
+def send_key_scancode(scancode: int, down: bool, extended: bool = False) -> None:
+    flags = KEYEVENTF_SCANCODE | (0 if down else KEYEVENTF_KEYUP)
+    if extended:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    extra = ctypes.c_ulong(0)
+    ki = _KEYBDINPUT(0, scancode, flags, 0, ctypes.pointer(extra))
+    inp = _INPUT(INPUT_KEYBOARD, _INPUTUNION(ki=ki))
     ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
@@ -315,6 +375,21 @@ def code_to_key(code: str, key: str):
     return None
 
 
+# When True, keyboard input is sent as hardware scancodes (works in games that
+# ignore pyautogui's virtual keys). Toggled by the viewer's "Game input" setting.
+GAME_INPUT = False
+
+
+def _send_key(code: str, key: str, down: bool) -> None:
+    if GAME_INPUT and code in SCANCODES:
+        sc, ext = SCANCODES[code]
+        send_key_scancode(sc, down, ext)
+        return
+    k = code_to_key(code, key)
+    if k:
+        (pyautogui.keyDown if down else pyautogui.keyUp)(k, _pause=False)
+
+
 def handle_input(msg: dict) -> None:
     t = msg.get("type")
     try:
@@ -333,13 +408,9 @@ def handle_input(msg: dict) -> None:
             # Browser deltaY is positive when scrolling down; wheel is positive up.
             send_mouse_wheel(-int(round(msg["dy"] * 1.2)))
         elif t == "keydown":
-            k = code_to_key(msg.get("code", ""), msg.get("key", ""))
-            if k:
-                pyautogui.keyDown(k, _pause=False)
+            _send_key(msg.get("code", ""), msg.get("key", ""), True)
         elif t == "keyup":
-            k = code_to_key(msg.get("code", ""), msg.get("key", ""))
-            if k:
-                pyautogui.keyUp(k, _pause=False)
+            _send_key(msg.get("code", ""), msg.get("key", ""), False)
     except Exception as e:
         print("input error:", e)
 
@@ -464,13 +535,16 @@ async def connect_once():
                 # Viewer settings (FPS / quality / cursor) arrive as "config";
                 # everything else is mouse/keyboard input.
                 if msg.get("type") == "config":
+                    global GAME_INPUT
                     if "fps" in msg:
                         track.fps = int(msg["fps"])
                     if "scale" in msg:
                         track.scale = float(msg["scale"])
                     if "cursor" in msg:
                         track.show_cursor = bool(msg["cursor"])
-                    print(f"config: fps={track.fps} scale={track.scale} cursor={track.show_cursor}")
+                    if "gameinput" in msg:
+                        GAME_INPUT = bool(msg["gameinput"])
+                    print(f"config: fps={track.fps} scale={track.scale} cursor={track.show_cursor} game={GAME_INPUT}")
                 else:
                     handle_input(msg)
 
@@ -558,10 +632,13 @@ async def connect_once():
                 # Input in WebSocket-streaming mode arrives here (no data channel).
                 handle_input(msg)
 
-            elif mtype == "config" and stream_state["run"]:
+            elif mtype == "config":
                 for k in ("fps", "scale", "quality", "cursor"):
                     if k in msg:
                         stream_state[k] = msg[k]
+                if "gameinput" in msg:
+                    global GAME_INPUT
+                    GAME_INPUT = bool(msg["gameinput"])
 
             elif mtype == "leave":
                 # Explicit "I'm leaving" from the viewer (button / page close).

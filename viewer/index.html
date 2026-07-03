@@ -122,11 +122,14 @@
             <option value="contain">Keep aspect (letterbox)</option>
             <option value="fill">Stretch to fill</option>
           </select></div>
+        <div class="field"><label for="adaptive">Auto-adjust quality (reduce lag)</label><input type="checkbox" id="adaptive"></div>
       </div>
 
       <div class="grp">
-        <h2>Mouse</h2>
+        <h2>Mouse &amp; keyboard</h2>
         <div class="field"><label for="lock">Capture mouse on click (gaming)</label><input type="checkbox" id="lock"></div>
+        <div class="field"><label for="gameinput">Game input mode (scancodes — fixes HL2 etc.)</label><input type="checkbox" id="gameinput"></div>
+        <div style="font-size:11px;color:var(--dim);margin:-4px 0 6px">While mouse is captured, press <b>\</b> (backslash) to send <b>Esc</b> to the game.</div>
         <div class="field"><label for="sens">Sensitivity</label>
           <input type="range" id="sens" min="0.2" max="3" step="0.1"><span class="val" id="sensV"></span></div>
         <div class="field"><label for="smooth">Smooth movement</label><input type="checkbox" id="smooth"></div>
@@ -180,7 +183,7 @@ const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "webrtc", quality: 55,
+  mode: "webrtc", quality: 55, gameinput: false, adaptive: true,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -198,6 +201,7 @@ function formToS() {
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
   S.relay = $("relayOn").checked;
   S.mode = $("mode").value;
+  S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
@@ -207,6 +211,7 @@ function sToForm() {
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
   $("relayOn").checked = S.relay;
   $("mode").value = S.mode;
+  $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -215,6 +220,10 @@ sToForm();
 // ---- Connection state -----------------------------------------------------
 let ws, pc, inputChannel, connected = false, settingsOpen = true;
 let wantConnected = false, reconnectTimer = null;
+// Adaptive quality: curFps/curScale are the *currently applied* values (start at
+// the user's settings, then auto-adjusted based on measured latency). mediaPing
+// is the latency of the actual video path.
+let curFps = 30, curScale = 1, mediaPing = null, lastAdapt = 0;
 
 // Auto-recover from a dropped connection (flaky relay) instead of dumping the
 // user back to the menu. Keeps retrying until they hit Leave.
@@ -238,7 +247,7 @@ function sendInput(o) {
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(o));
 }
 function sendConfig() {
-  const cfg = { type: "config", fps: S.fps, scale: S.scale, cursor: S.cursor, quality: S.quality };
+  const cfg = { type: "config", fps: curFps, scale: curScale, cursor: S.cursor, quality: S.quality, gameinput: S.gameinput };
   if (S.mode === "wsvideo") wsSend(cfg);
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(cfg));
 }
@@ -266,6 +275,7 @@ function openSettings() {
 }
 function closeSettings() {
   formToS(); saveSettings();
+  curFps = S.fps; curScale = S.scale;   // user changed settings → reset adaptive baseline
   applyVideoStyle();
   sendConfig();
   hud.style.display = S.hud ? "block" : "none";
@@ -432,6 +442,7 @@ async function networkTest() {
 
 function connect() {
   wantConnected = true;
+  curFps = S.fps; curScale = S.scale; mediaPing = null;
   debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
@@ -477,7 +488,7 @@ function connect() {
 // ---- WebSocket video mode -------------------------------------------------
 function requestStream() {
   dbg("Requesting WebSocket video stream…");
-  wsSend({ type: "start-stream", fps: S.fps, scale: S.scale, quality: S.quality, cursor: S.cursor });
+  wsSend({ type: "start-stream", fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput });
 }
 
 let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0, wsPing = null;
@@ -627,6 +638,13 @@ document.addEventListener("contextmenu", (e) => { if (connected) e.preventDefaul
 
 document.addEventListener("keydown", (e) => {
   if (!connected) return;
+  // While captured, backslash sends a real Esc to the game (the browser steals
+  // the actual Esc key to exit pointer lock, so games can't otherwise get it).
+  if (e.code === "Backslash" && locked()) {
+    e.preventDefault();
+    sendInput({ type: "keydown", code: "Escape", key: "Escape" });
+    return;
+  }
   if (e.key === "Escape") {            // Esc: release lock, then open settings
     if (locked()) return;              // (browser exits lock first; next press opens panel)
     if (!settingsOpen) { openSettings(); e.preventDefault(); return; }
@@ -637,16 +655,43 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("keyup", (e) => {
   if (!connected || settingsOpen) return;
+  if (e.code === "Backslash" && locked()) { e.preventDefault(); sendInput({ type: "keyup", code: "Escape", key: "Escape" }); return; }
   e.preventDefault();
   sendInput({ type: "keyup", code: e.code, key: e.key });
 });
+
+// ---- Adaptive quality -----------------------------------------------------
+// Instead of a hard cap, watch the real latency: when it climbs (server/relay
+// is stressed) back off frame rate, then resolution; when it's healthy, recover
+// toward the user's chosen settings. This keeps input responsive automatically.
+function adaptQuality() {
+  if (!connected || !S.adaptive || mediaPing == null) return;
+  const now = performance.now();
+  if (now - lastAdapt < 2500) return;             // don't thrash
+  if (mediaPing > 220) {                            // stressed — reduce
+    let nf = curFps, ns = curScale;
+    if (curFps > 12) nf = Math.max(12, curFps - 6);        // drop fps first
+    else if (curScale > 0.25) ns = Math.max(0.25, +(curScale - 0.25).toFixed(2));
+    if (nf !== curFps || ns !== curScale) {
+      curFps = nf; curScale = ns; lastAdapt = now; sendConfig();
+      dbg(`Adaptive: ping ${Math.round(mediaPing)}ms → fps ${curFps}, res ${Math.round(curScale*100)}%`, "warn");
+    }
+  } else if (mediaPing < 90 && (curScale < S.scale || curFps < S.fps)) {  // healthy — recover
+    let nf = curFps, ns = curScale;
+    if (curScale < S.scale) ns = Math.min(S.scale, +(curScale + 0.25).toFixed(2));
+    else if (curFps < S.fps) nf = Math.min(S.fps, curFps + 4);
+    if (nf !== curFps || ns !== curScale) { curFps = nf; curScale = ns; lastAdapt = now; sendConfig(); }
+  }
+}
 
 // ---- Stats HUD + media diagnostics ----------------------------------------
 let lastBytes = 0, lastTs = 0, connectedAt = 0, noFrameWarned = false;
 async function pollStats() {
   if (!connected) return;
   if (S.mode === "wsvideo") {          // WebSocket mode has no pc — show frame stats
-    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b><br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
+    mediaPing = wsPing;
+    adaptQuality();
+    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
       (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     return;
   }
@@ -697,6 +742,8 @@ async function pollStats() {
     let kbps = 0;
     if (lastTs && ts > lastTs) kbps = Math.round((bytes - lastBytes) * 8 / (ts - lastTs));
     lastBytes = bytes; lastTs = ts;
+    if (rtt != null) mediaPing = Math.round(rtt * 1000);
+    adaptQuality();
     const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
     if (S.hud) {
       hud.innerHTML =
