@@ -475,7 +475,10 @@ def make_nvenc(w: int, h: int, fps: int, bitrate: int):
     enc.framerate = fractions.Fraction(fps, 1)
     enc.time_base = fractions.Fraction(1, fps)
     enc.bit_rate = bitrate
-    enc.gop_size = max(30, fps * 2)          # keyframe every ~2s
+    # WebSocket is reliable (TCP), so we don't need periodic keyframes — they're
+    # big and cause recurring latency spikes. Use a huge GOP (only 1 keyframe at
+    # start) and request more on-demand if the decoder ever needs to resync.
+    enc.gop_size = 100000
     enc.options = {"preset": "p1", "tune": "ull", "zerolatency": "1", "delay": "0", "rc": "cbr"}
     return enc
 
@@ -526,6 +529,9 @@ async def connect_once():
                     scale = float(stream_state["scale"])
                     w = max(2, int(SCREEN_W * scale)) & ~1
                     h = max(2, int(SCREEN_H * scale)) & ~1
+                    if stream_state.get("force_key"):
+                        cur = (0, 0, 0)         # rebuild encoder -> emits a keyframe
+                        stream_state["force_key"] = False
                     if (w, h, fps) != cur:
                         if enc is not None:
                             for _p in enc.encode(None):
@@ -714,6 +720,9 @@ async def connect_once():
             elif mtype == "ping":
                 # Latency probe: echo the viewer's timestamp straight back.
                 await ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
+
+            elif mtype == "request-keyframe":
+                stream_state["force_key"] = True    # decoder needs to resync
 
             elif mtype in ("mousemove", "mousemoverel", "mousedown", "mouseup",
                            "wheel", "keydown", "keyup"):

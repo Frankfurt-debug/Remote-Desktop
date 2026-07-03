@@ -35,11 +35,14 @@
   #hud .lock { color:#ffd479; }
 
   /* Settings / connect overlay */
-  #overlay { position:fixed; inset:0; z-index:10; display:flex; align-items:center; justify-content:center;
-             background:rgba(0,0,0,.82); backdrop-filter:blur(3px); overflow:auto; }
+  #overlay { position:fixed; inset:0; z-index:10; display:flex; align-items:flex-start; justify-content:center;
+             background:rgba(0,0,0,.82); backdrop-filter:blur(3px); overflow-y:auto; padding:16px 0; box-sizing:border-box; }
   #overlay.hidden { display:none; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:22px 24px;
-           width:380px; max-width:92vw; box-shadow:0 16px 50px rgba(0,0,0,.5); }
+  /* max-height + internal scroll so every field stays reachable on short screens
+     (Chromebooks) without zooming out. */
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px 22px;
+           width:380px; max-width:92vw; box-shadow:0 16px 50px rgba(0,0,0,.5);
+           max-height:calc(100vh - 32px); overflow-y:auto; margin:auto; }
   .panel h1 { font-size:19px; margin:0 0 4px; }
   .panel .sub { color:var(--dim); font-size:13px; margin:0 0 16px; }
   .grp { border-top:1px solid var(--line); padding:13px 0 4px; }
@@ -512,7 +515,7 @@ function setupDecoder(codecStr) {
     waitingKey = true; chunkTs = 0;
     decoder = new VideoDecoder({
       output: (frame) => { drawVideoFrame(frame); frame.close(); },
-      error: (e) => { dbg("decoder error: " + e.message, "bad"); waitingKey = true; },
+      error: (e) => { dbg("decoder error: " + e.message, "bad"); waitingKey = true; wsSend({ type: "request-keyframe" }); },
     });
     decoder.configure({ codec: codecStr, optimizeForLatency: true });
     dbg("H.264 decoder ready (" + codecStr + ")", "ok");
@@ -526,7 +529,7 @@ function decodeH264(buf) {
   try {
     decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: chunkTs, data: arr.subarray(1) }));
     chunkTs += Math.round(1e6 / Math.max(1, curFps));
-  } catch (e) { dbg("decode err: " + e.message, "bad"); waitingKey = true; }
+  } catch (e) { dbg("decode err: " + e.message, "bad"); waitingKey = true; wsSend({ type: "request-keyframe" }); }
 }
 function drawVideoFrame(frame) {
   if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -739,21 +742,22 @@ document.addEventListener("keyup", (e) => {
 // is stressed) back off frame rate, then resolution; when it's healthy, recover
 // toward the user's chosen settings. This keeps input responsive automatically.
 function adaptQuality() {
-  if (!connected || !S.adaptive || mediaPing == null) return;
+  if (!connected || !S.adaptive || curLag == null || baseLag == null) return;
   const now = performance.now();
-  if (now - lastAdapt < 2500) return;             // don't thrash
-  if (mediaPing > 220) {                            // stressed — reduce
+  if (now - lastAdapt < 2000) return;             // don't thrash
+  const buildup = curLag - baseLag;               // queue delay above the floor
+  if (buildup > 45) {                              // congested — back off
     let nf = curFps, ns = curScale;
-    if (curFps > 12) nf = Math.max(12, curFps - 6);        // drop fps first
+    if (curFps > 15) nf = Math.max(15, curFps - 6);        // drop fps first (less jarring)
     else if (curScale > 0.25) ns = Math.max(0.25, +(curScale - 0.25).toFixed(2));
     if (nf !== curFps || ns !== curScale) {
       curFps = nf; curScale = ns; lastAdapt = now; sendConfig();
-      dbg(`Adaptive: ping ${Math.round(mediaPing)}ms → fps ${curFps}, res ${Math.round(curScale*100)}%`, "warn");
+      dbg(`Adaptive: buildup ${Math.round(buildup)}ms → fps ${curFps}, res ${Math.round(curScale*100)}%`, "warn");
     }
-  } else if (mediaPing < 90 && (curScale < S.scale || curFps < S.fps)) {  // healthy — recover
+  } else if (buildup < 12 && (curScale < S.scale || curFps < S.fps)) {  // clear — recover
     let nf = curFps, ns = curScale;
     if (curScale < S.scale) ns = Math.min(S.scale, +(curScale + 0.25).toFixed(2));
-    else if (curFps < S.fps) nf = Math.min(S.fps, curFps + 4);
+    else if (curFps < S.fps) nf = Math.min(S.fps, curFps + 3);
     if (nf !== curFps || ns !== curScale) { curFps = nf; curScale = ns; lastAdapt = now; sendConfig(); }
   }
 }
