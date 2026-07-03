@@ -100,7 +100,8 @@
         <div class="field" style="margin-top:10px"><label for="mode">Connection mode</label>
           <select id="mode">
             <option value="webrtc">WebRTC (fast — same network)</option>
-            <option value="wsvideo">WebSocket (works through filters)</option>
+            <option value="gpu">GPU H.264 (best — through filters)</option>
+            <option value="wsvideo">WebSocket JPEG (most compatible)</option>
           </select></div>
         <div class="field"><label for="relayOn">Force relay (WebRTC only)</label><input type="checkbox" id="relayOn"></div>
         <div style="font-size:11px;color:var(--dim);margin-top:2px">School Chromebook blocked? Use <b>WebSocket</b> mode.</div>
@@ -158,9 +159,12 @@ const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
 const ctx = canvas.getContext("2d");
-// The element currently showing the remote screen (video for WebRTC, canvas for
-// WebSocket mode) — used for pointer lock and coordinate mapping.
-const displayEl = () => (S.mode === "wsvideo" ? canvas : video);
+// "gpu" (H.264/WebCodecs) and "wsvideo" (JPEG) both stream over the WebSocket
+// and render to the canvas. WebRTC uses the <video> element.
+const isWs = () => S.mode === "wsvideo" || S.mode === "gpu";
+// The element currently showing the remote screen — used for pointer lock and
+// coordinate mapping.
+const displayEl = () => (isWs() ? canvas : video);
 
 // ---- Diagnostics log ------------------------------------------------------
 // Shows each connection step so we can see exactly where it gets stuck:
@@ -242,13 +246,13 @@ function setStatus(s) { statusEl.textContent = s; }
 function wsSend(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
 function sendInput(o) {
   if (settingsOpen) return;
-  // WebSocket mode: input rides the signaling socket. WebRTC mode: the data channel.
-  if (S.mode === "wsvideo") wsSend(o);
+  // WebSocket modes: input rides the signaling socket. WebRTC: the data channel.
+  if (isWs()) wsSend(o);
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(o));
 }
 function sendConfig() {
   const cfg = { type: "config", fps: curFps, scale: curScale, cursor: S.cursor, quality: S.quality, gameinput: S.gameinput };
-  if (S.mode === "wsvideo") wsSend(cfg);
+  if (isWs()) wsSend(cfg);
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(cfg));
 }
 
@@ -455,7 +459,7 @@ function connect() {
     wsSend({ type: "register", role: "viewer", room: S.room });
     dbg("Registered as viewer (room: " + S.room + ")");
     setStatus("waiting for host… (free server can take ~50s to wake)");
-    if (S.mode === "wsvideo") requestStream();
+    if (isWs()) requestStream();
     // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and
     // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
@@ -465,15 +469,19 @@ function connect() {
     ws._ping = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "ping", t: performance.now() }); }, 2000);
   };
   ws.onmessage = async (ev) => {
-    // Binary payload = a JPEG video frame (WebSocket streaming mode).
-    if (ev.data instanceof ArrayBuffer) { renderFrame(ev.data); return; }
+    // Binary payload = a video frame: JPEG (wsvideo) or H.264 access unit (gpu).
+    if (ev.data instanceof ArrayBuffer) {
+      if (S.mode === "gpu") decodeH264(ev.data); else renderFrame(ev.data);
+      return;
+    }
     const m = JSON.parse(ev.data);
     if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); }
+    else if (m.type === "codec-info") { setupDecoder(m.codec); }
     else if (m.type === "offer") {
-      if (S.mode === "wsvideo") return;   // ignore WebRTC in WebSocket mode
+      if (isWs()) return;   // ignore WebRTC in WebSocket modes
       dbg("Offer received from host ✓", "ok"); await handleOffer(m);
     }
-    else if (m.type === "host-ready") { dbg("Host is ready"); if (S.mode === "wsvideo") requestStream(); }
+    else if (m.type === "host-ready") { dbg("Host is ready"); if (isWs()) requestStream(); }
     else if (m.type === "peer-left") {
       dbg("Host signaling dropped", "warn");
       // If media is still flowing, keep it (WebRTC is independent of signaling).
@@ -487,8 +495,53 @@ function connect() {
 
 // ---- WebSocket video mode -------------------------------------------------
 function requestStream() {
-  dbg("Requesting WebSocket video stream…");
-  wsSend({ type: "start-stream", fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput });
+  const codec = S.mode === "gpu" ? "h264" : "jpeg";
+  dbg("Requesting " + (codec === "h264" ? "GPU H.264" : "JPEG") + " stream…");
+  wsSend({ type: "start-stream", codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput });
+}
+
+// ---- GPU H.264 decode (WebCodecs) -----------------------------------------
+let decoder = null, waitingKey = true, chunkTs = 0;
+function setupDecoder(codecStr) {
+  if (!("VideoDecoder" in window)) { dbg("No WebCodecs in this browser — use JPEG mode.", "bad"); return; }
+  try {
+    if (decoder) { try { decoder.close(); } catch {} }
+    waitingKey = true; chunkTs = 0;
+    decoder = new VideoDecoder({
+      output: (frame) => { drawVideoFrame(frame); frame.close(); },
+      error: (e) => { dbg("decoder error: " + e.message, "bad"); waitingKey = true; },
+    });
+    decoder.configure({ codec: codecStr, optimizeForLatency: true });
+    dbg("H.264 decoder ready (" + codecStr + ")", "ok");
+  } catch (e) { dbg("decoder setup failed: " + e.message, "bad"); }
+}
+function decodeH264(buf) {
+  if (!decoder || decoder.state !== "configured") return;
+  const arr = new Uint8Array(buf);
+  const key = arr[0] === 1;
+  if (waitingKey) { if (!key) return; waitingKey = false; }   // must start on a keyframe
+  try {
+    decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: chunkTs, data: arr.subarray(1) }));
+    chunkTs += Math.round(1e6 / Math.max(1, curFps));
+  } catch (e) { dbg("decode err: " + e.message, "bad"); waitingKey = true; }
+}
+function drawVideoFrame(frame) {
+  if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+    canvas.width = frame.displayWidth; canvas.height = frame.displayHeight;
+  }
+  ctx.drawImage(frame, 0, 0);
+  frameCount++; fpsWin++;
+  const now = performance.now();
+  if (now - fpsWinT > 1000) { fpsShown = Math.round(fpsWin * 1000 / (now - fpsWinT)); fpsWin = 0; fpsWinT = now; }
+  if (!connected) {
+    connected = true;
+    video.style.display = "none"; canvas.style.display = "block";
+    document.body.classList.add("streaming");
+    applyVideoStyle();
+    dbg("First H.264 frame decoded ✓ — GPU video is LIVE 🎉", "ok");
+    closeSettings();
+    setStatus("");
+  }
 }
 
 let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0, wsPing = null;
@@ -581,7 +634,8 @@ function waitIceComplete(pc) {
 }
 
 function teardown() {
-  if (S.mode === "wsvideo") { try { wsSend({ type: "stop-stream" }); } catch {} }
+  if (isWs()) { try { wsSend({ type: "stop-stream" }); } catch {} }
+  if (decoder) { try { decoder.close(); } catch {} decoder = null; }
   if (pc) { try { pc.close(); } catch {} pc = null; }
   inputChannel = null; connected = false;
   video.srcObject = null;
@@ -642,7 +696,7 @@ document.addEventListener("keydown", (e) => {
   // the actual Esc key to exit pointer lock, so games can't otherwise get it).
   if (e.code === "Backslash" && locked()) {
     e.preventDefault();
-    sendInput({ type: "keydown", code: "Escape", key: "Escape" });
+    sendInput({ type: "keydown", code: "Escape", key: "Escape", sc: true });
     return;
   }
   if (e.key === "Escape") {            // Esc: release lock, then open settings
@@ -655,7 +709,7 @@ document.addEventListener("keydown", (e) => {
 });
 document.addEventListener("keyup", (e) => {
   if (!connected || settingsOpen) return;
-  if (e.code === "Backslash" && locked()) { e.preventDefault(); sendInput({ type: "keyup", code: "Escape", key: "Escape" }); return; }
+  if (e.code === "Backslash" && locked()) { e.preventDefault(); sendInput({ type: "keyup", code: "Escape", key: "Escape", sc: true }); return; }
   e.preventDefault();
   sendInput({ type: "keyup", code: e.code, key: e.key });
 });
@@ -688,10 +742,10 @@ function adaptQuality() {
 let lastBytes = 0, lastTs = 0, connectedAt = 0, noFrameWarned = false;
 async function pollStats() {
   if (!connected) return;
-  if (S.mode === "wsvideo") {          // WebSocket mode has no pc — show frame stats
+  if (isWs()) {                        // WebSocket modes have no pc — show frame stats
     mediaPing = wsPing;
     adaptQuality();
-    if (S.hud) hud.innerHTML = `Mode <b>WS</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
+    if (S.hud) hud.innerHTML = `Mode <b>${S.mode === "gpu" ? "GPU H.264" : "JPEG"}</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b><br>Frames <b>${frameCount}</b>` +
       (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
     return;
   }

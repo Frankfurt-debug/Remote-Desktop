@@ -49,6 +49,7 @@ from aiortc import (
     VideoStreamTrack,
 )
 from aiortc.sdp import candidate_from_sdp
+import av
 from av import VideoFrame
 
 # ----------------------------------------------------------------------------
@@ -380,8 +381,8 @@ def code_to_key(code: str, key: str):
 GAME_INPUT = False
 
 
-def _send_key(code: str, key: str, down: bool) -> None:
-    if GAME_INPUT and code in SCANCODES:
+def _send_key(code: str, key: str, down: bool, force_scancode: bool = False) -> None:
+    if (GAME_INPUT or force_scancode) and code in SCANCODES:
         sc, ext = SCANCODES[code]
         send_key_scancode(sc, down, ext)
         return
@@ -408,9 +409,9 @@ def handle_input(msg: dict) -> None:
             # Browser deltaY is positive when scrolling down; wheel is positive up.
             send_mouse_wheel(-int(round(msg["dy"] * 1.2)))
         elif t == "keydown":
-            _send_key(msg.get("code", ""), msg.get("key", ""), True)
+            _send_key(msg.get("code", ""), msg.get("key", ""), True, msg.get("sc", False))
         elif t == "keyup":
-            _send_key(msg.get("code", ""), msg.get("key", ""), False)
+            _send_key(msg.get("code", ""), msg.get("key", ""), False, msg.get("sc", False))
     except Exception as e:
         print("input error:", e)
 
@@ -451,6 +452,34 @@ def cap_video_bitrate(sdp: str, kbps: int) -> str:
     return "\r\n".join(out)
 
 
+def h264_codec_string(annexb: bytes) -> str:
+    """Extract the WebCodecs codec string (avc1.PPCCLL) from the SPS in an
+    Annex-B H.264 keyframe, so the browser's decoder can be configured."""
+    i, n = 0, len(annexb)
+    while i < n - 5:
+        if annexb[i] == 0 and annexb[i + 1] == 0 and annexb[i + 2] == 1:
+            if (annexb[i + 3] & 0x1F) == 7:                 # SPS NAL
+                p, c, l = annexb[i + 4], annexb[i + 5], annexb[i + 6]
+                return "avc1.%02X%02X%02X" % (p, c, l)
+            i += 3
+        else:
+            i += 1
+    return "avc1.42E01F"
+
+
+def make_nvenc(w: int, h: int, fps: int, bitrate: int):
+    """Create a low-latency H.264 NVENC encoder for the given size/fps/bitrate."""
+    enc = av.codec.CodecContext.create("h264_nvenc", "w")
+    enc.width, enc.height = w, h
+    enc.pix_fmt = "yuv420p"
+    enc.framerate = fractions.Fraction(fps, 1)
+    enc.time_base = fractions.Fraction(1, fps)
+    enc.bit_rate = bitrate
+    enc.gop_size = max(30, fps * 2)          # keyframe every ~2s
+    enc.options = {"preset": "p1", "tune": "ull", "zerolatency": "1", "delay": "0", "rc": "cbr"}
+    return enc
+
+
 async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     if pc.iceGatheringState == "complete":
         return
@@ -465,6 +494,7 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
 
 
 async def connect_once():
+    global GAME_INPUT
     async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
         await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM}))
         print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
@@ -475,8 +505,63 @@ async def connect_once():
         # Instead of WebRTC/DTLS, capture -> JPEG -> send as binary over the same
         # signaling socket the viewer already uses. Slower/heavier than WebRTC but
         # rides the one channel a strict filter reliably allows.
-        stream_state = {"run": False, "fps": 12, "scale": 0.5, "quality": 55, "cursor": True}
+        stream_state = {"run": False, "fps": 12, "scale": 0.5, "quality": 55, "cursor": True, "codec": "jpeg"}
         stream_task = None
+
+        async def nvenc_stream():
+            # GPU (NVENC) H.264 over the WebSocket: hardware-encoded, only sends
+            # what changed between frames. Each binary message = 1 byte keyframe
+            # flag + the H.264 access unit. A "codec-info" JSON precedes the video.
+            loop = asyncio.get_event_loop()
+            print("NVENC H.264 stream: started")
+            enc = None
+            cur = (0, 0, 0)         # (w, h, fps) the encoder was built for
+            need_codec_info = False
+            pts = 0
+            frames = 0
+            while stream_state["run"]:
+                t0 = time.time()
+                try:
+                    fps = max(1, min(60, int(stream_state["fps"])))
+                    scale = float(stream_state["scale"])
+                    w = max(2, int(SCREEN_W * scale)) & ~1
+                    h = max(2, int(SCREEN_H * scale)) & ~1
+                    if (w, h, fps) != cur:
+                        if enc is not None:
+                            for _p in enc.encode(None):
+                                pass
+                        # ~0.1 bit/pixel/frame is a reasonable H.264 target.
+                        bitrate = max(800_000, min(12_000_000, int(w * h * fps * 0.1)))
+                        enc = make_nvenc(w, h, fps, bitrate)
+                        cur = (w, h, fps)
+                        need_codec_info = True
+                        print(f"NVENC: {w}x{h}@{fps} {bitrate // 1000}kbps")
+
+                    arr, ml, mt = await loop.run_in_executor(None, _grab, MONITOR)
+                    if stream_state["cursor"]:
+                        draw_cursor(arr, ml, mt)
+                    frame = VideoFrame.from_ndarray(arr, format="rgb24")
+                    frame = frame.reformat(width=w, height=h, format="yuv420p")
+                    frame.pts = pts
+                    frame.time_base = fractions.Fraction(1, fps)
+                    pts += 1
+                    for pkt in enc.encode(frame):
+                        data = bytes(pkt)
+                        if need_codec_info and pkt.is_keyframe:
+                            cs = h264_codec_string(data)
+                            await ws.send(json.dumps({"type": "codec-info", "w": w, "h": h, "codec": cs}))
+                            need_codec_info = False
+                        await ws.send((b"\x01" if pkt.is_keyframe else b"\x00") + data)
+                        frames += 1
+                except Exception as e:
+                    print("nvenc error:", e)
+                    await asyncio.sleep(0.3)
+                    cur = (0, 0, 0)   # rebuild encoder after an error
+                interval = 1.0 / max(1, int(stream_state["fps"]))
+                dt = time.time() - t0
+                if dt < interval:
+                    await asyncio.sleep(interval - dt)
+            print(f"NVENC H.264 stream: stopped ({frames} packets)")
 
         async def ws_stream():
             loop = asyncio.get_event_loop()
@@ -612,13 +697,16 @@ async def connect_once():
                 if pc:
                     await pc.close()
                     pc = None
-                for k in ("fps", "scale", "quality", "cursor"):
+                for k in ("fps", "scale", "quality", "cursor", "codec"):
                     if k in msg:
                         stream_state[k] = msg[k]
+                if "gameinput" in msg:
+                    GAME_INPUT = bool(msg["gameinput"])
                 stream_state["run"] = True
-                print(f"start-stream: fps={stream_state['fps']} scale={stream_state['scale']} q={stream_state['quality']}")
+                codec = stream_state.get("codec", "jpeg")
+                print(f"start-stream: codec={codec} fps={stream_state['fps']} scale={stream_state['scale']}")
                 if stream_task is None or stream_task.done():
-                    stream_task = asyncio.create_task(ws_stream())
+                    stream_task = asyncio.create_task(nvenc_stream() if codec == "h264" else ws_stream())
 
             elif mtype == "stop-stream":
                 stream_state["run"] = False
@@ -637,7 +725,6 @@ async def connect_once():
                     if k in msg:
                         stream_state[k] = msg[k]
                 if "gameinput" in msg:
-                    global GAME_INPUT
                     GAME_INPUT = bool(msg["gameinput"])
 
             elif mtype == "leave":
