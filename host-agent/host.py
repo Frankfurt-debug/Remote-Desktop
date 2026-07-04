@@ -50,7 +50,7 @@ from aiortc import (
 )
 from aiortc.sdp import candidate_from_sdp
 import av
-from av import VideoFrame
+from av import AudioFrame, VideoFrame
 
 # ----------------------------------------------------------------------------
 # Config
@@ -510,6 +510,57 @@ async def connect_once():
         # rides the one channel a strict filter reliably allows.
         stream_state = {"run": False, "fps": 12, "scale": 0.5, "quality": 55, "cursor": True, "codec": "jpeg"}
         stream_task = None
+        audio_state = {"run": False}
+        audio_task = None
+
+        async def audio_stream():
+            # Capture the PC's audio output (WASAPI loopback), Opus-encode, and
+            # send as tagged binary (0x02) over the same socket as the video.
+            try:
+                import soundcard as sc
+            except Exception as e:
+                print("audio unavailable (pip install soundcard):", e)
+                return
+            import queue as _q
+            import threading
+            loop = asyncio.get_event_loop()
+            q = _q.Queue(maxsize=8)
+
+            def capture():
+                try:
+                    enc = av.codec.CodecContext.create("libopus", "w")
+                    enc.sample_rate = 48000
+                    enc.format = "s16"
+                    enc.layout = "stereo"
+                    enc.bit_rate = 96000
+                    spk = sc.default_speaker()
+                    mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
+                    with mic.recorder(samplerate=48000, channels=2, blocksize=480) as rec:
+                        while audio_state["run"]:
+                            data = rec.record(numframes=960)          # 20ms stereo float32
+                            i16 = (np.clip(data, -1, 1) * 32767).astype(np.int16).reshape(1, -1)
+                            frame = AudioFrame.from_ndarray(i16, format="s16", layout="stereo")
+                            frame.sample_rate = 48000
+                            for p in enc.encode(frame):
+                                try:
+                                    q.put_nowait(bytes(p))
+                                except _q.Full:
+                                    pass                              # drop if backed up (keep latency low)
+                except Exception as e:
+                    print("audio capture error:", e)
+
+            threading.Thread(target=capture, daemon=True).start()
+            print("audio: started")
+            while audio_state["run"]:
+                try:
+                    data = await loop.run_in_executor(None, q.get, True, 0.5)
+                except Exception:
+                    continue
+                try:
+                    await ws.send(b"\x02" + data)
+                except Exception:
+                    break
+            print("audio: stopped")
 
         async def nvenc_stream():
             # GPU (NVENC) H.264 over the WebSocket: hardware-encoded, only sends
@@ -589,7 +640,7 @@ async def connect_once():
                     img.save(buf, format="JPEG", quality=int(stream_state["quality"]))
                     data = buf.getvalue()
                     if data != last:            # skip unchanged frames to save bandwidth
-                        await ws.send(data)
+                        await ws.send(b"\x03" + data)     # 0x03 = JPEG frame
                         last = data
                         frames += 1
                 except Exception as e:
@@ -716,6 +767,16 @@ async def connect_once():
 
             elif mtype == "stop-stream":
                 stream_state["run"] = False
+                audio_state["run"] = False
+
+            elif mtype == "enable-audio":
+                if not audio_state["run"]:
+                    audio_state["run"] = True
+                    audio_task = asyncio.create_task(audio_stream())
+                    print("audio enabled")
+
+            elif mtype == "disable-audio":
+                audio_state["run"] = False
 
             elif mtype == "ping":
                 # Latency probe: echo the viewer's timestamp straight back.
@@ -741,6 +802,7 @@ async def connect_once():
                 # Always tear down cleanly so the next connection starts fresh.
                 print("viewer left (explicit)")
                 stream_state["run"] = False
+                audio_state["run"] = False
                 if pc:
                     await pc.close()
                     pc = None
@@ -749,6 +811,7 @@ async def connect_once():
                 # WS-video rides this socket, so it can't survive the viewer
                 # leaving — stop streaming (it restarts when they reconnect).
                 stream_state["run"] = False
+                audio_state["run"] = False
                 # For WebRTC, the media is independent of signaling, so a dropped
                 # socket must NOT tear a connected stream down (flaky/filtered
                 # networks would kill a working stream). Only clean up if it
