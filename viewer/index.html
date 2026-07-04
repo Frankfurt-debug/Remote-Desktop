@@ -128,6 +128,8 @@
           </select></div>
         <div class="field"><label for="adaptive">Auto-adjust quality (reduce lag)</label><input type="checkbox" id="adaptive"></div>
         <div class="field"><label for="audio">Enable audio (hear the PC)</label><input type="checkbox" id="audio"></div>
+        <div class="field"><label for="mic">Enable microphone (talk to the PC)</label><input type="checkbox" id="mic"></div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px">Mic plays into the PC's output — set the game's mic to <b>Stereo Mix</b>.</div>
       </div>
 
       <div class="grp">
@@ -191,7 +193,7 @@ const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "webrtc", quality: 55, gameinput: false, adaptive: true, audio: false,
+  mode: "webrtc", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -209,7 +211,7 @@ function formToS() {
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
   S.relay = $("relayOn").checked;
   S.mode = $("mode").value;
-  S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked;
+  S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
@@ -219,7 +221,7 @@ function sToForm() {
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
   $("relayOn").checked = S.relay;
   $("mode").value = S.mode;
-  $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio;
+  $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -511,6 +513,7 @@ function requestStream() {
   dbg("Requesting " + (codec === "h264" ? "GPU H.264" : "JPEG") + " stream…");
   wsSend({ type: "start-stream", codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput });
   if (S.audio) { setupAudio(); wsSend({ type: "enable-audio" }); }
+  if (S.mic) startMic();
 }
 
 // ---- GPU H.264 decode (WebCodecs) -----------------------------------------
@@ -600,6 +603,45 @@ function playAudioData(ad) {
   src.start(nextAudioT);
   nextAudioT += buf.duration;
   audioDelayMs = Math.round((nextAudioT - now) * 1000);
+}
+
+// ---- Microphone (here -> host, Opus over WebSocket, tagged 0x04) -----------
+let micStream = null, micEncoder = null, micReader = null, micOn = false;
+async function startMic() {
+  if (micOn) return;
+  if (!("AudioEncoder" in window) || !("MediaStreamTrackProcessor" in window)) { dbg("No WebCodecs mic support", "warn"); return; }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 } });
+    const track = micStream.getAudioTracks()[0];
+    micReader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    micEncoder = new AudioEncoder({
+      output: (chunk) => {
+        const b = new Uint8Array(chunk.byteLength + 1);
+        b[0] = 4;                                  // 0x04 = mic audio
+        chunk.copyTo(b.subarray(1));
+        if (ws && ws.readyState === 1) ws.send(b);
+      },
+      error: (e) => dbg("mic encode err: " + e.message, "bad"),
+    });
+    micEncoder.configure({ codec: "opus", sampleRate: 48000, numberOfChannels: 1, bitrate: 32000 });
+    micOn = true;
+    wsSend({ type: "enable-mic" });
+    dbg("Microphone ON 🎤 (set the game's mic to Stereo Mix)", "ok");
+    while (micOn) {
+      const { value, done } = await micReader.read();
+      if (done) break;
+      if (micEncoder && micEncoder.state === "configured") micEncoder.encode(value);
+      value.close();
+    }
+  } catch (e) { dbg("mic error: " + e.message + " (mic blocked or unavailable)", "bad"); micOn = false; }
+}
+function stopMic() {
+  micOn = false;
+  try { wsSend({ type: "disable-mic" }); } catch {}
+  if (micReader) { try { micReader.cancel(); } catch {} micReader = null; }
+  if (micEncoder) { try { micEncoder.close(); } catch {} micEncoder = null; }
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
 }
 
 let frameCount = 0, fpsWin = 0, fpsWinT = 0, fpsShown = 0, wsPing = null;
@@ -713,6 +755,7 @@ function teardown() {
   if (decoder) { try { decoder.close(); } catch {} decoder = null; }
   if (audioDec) { try { audioDec.close(); } catch {} audioDec = null; }
   if (audioCtx) { try { audioCtx.close(); } catch {} audioCtx = null; }
+  stopMic();
   if (pc) { try { pc.close(); } catch {} pc = null; }
   inputChannel = null; connected = false;
   video.srcObject = null;

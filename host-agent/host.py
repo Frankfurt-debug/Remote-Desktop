@@ -562,6 +562,37 @@ async def connect_once():
                     break
             print("audio: stopped")
 
+        # Microphone: viewer sends Opus (tagged 0x04); we decode and play it to an
+        # output device. Set MIC_OUT_DEVICE to a device name (e.g. a VB-Cable) —
+        # default is the main speaker, which "Stereo Mix" captures so games can use
+        # Stereo Mix as their microphone.
+        mic_state = {"run": False, "q": None}
+
+        def mic_player(q):
+            try:
+                import soundcard as sc
+                dec = av.codec.CodecContext.create("libopus", "r")
+                dec.sample_rate = 48000
+                dec.format = "s16"
+                dec.layout = "mono"
+                dev = os.environ.get("MIC_OUT_DEVICE")
+                spk = sc.get_speaker(dev) if dev else sc.default_speaker()
+                print("mic -> playing into:", spk.name)
+                with spk.player(samplerate=48000, channels=1, blocksize=480) as player:
+                    while mic_state["run"]:
+                        try:
+                            data = q.get(timeout=0.5)
+                        except Exception:
+                            continue
+                        try:
+                            for fr in dec.decode(av.packet.Packet(data)):
+                                arr = fr.to_ndarray().reshape(-1).astype(np.float32) / 32768.0
+                                player.play(arr.reshape(-1, 1))
+                        except Exception as e:
+                            print("mic decode error:", e)
+            except Exception as e:
+                print("mic player error (is 'soundcard' installed?):", e)
+
         async def nvenc_stream():
             # GPU (NVENC) H.264 over the WebSocket: hardware-encoded, only sends
             # what changed between frames. Each binary message = 1 byte keyframe
@@ -716,6 +747,15 @@ async def connect_once():
             print("offer sent")
 
         async for raw in ws:
+            # Binary from the viewer = microphone audio (tagged 0x04).
+            if isinstance(raw, (bytes, bytearray)):
+                if raw and raw[0] == 4 and mic_state["run"] and mic_state["q"] is not None:
+                    try:
+                        mic_state["q"].put_nowait(bytes(raw[1:]))
+                    except Exception:
+                        pass
+                continue
+
             msg = json.loads(raw)
             mtype = msg.get("type")
 
@@ -768,6 +808,7 @@ async def connect_once():
             elif mtype == "stop-stream":
                 stream_state["run"] = False
                 audio_state["run"] = False
+                mic_state["run"] = False
 
             elif mtype == "enable-audio":
                 if not audio_state["run"]:
@@ -777,6 +818,18 @@ async def connect_once():
 
             elif mtype == "disable-audio":
                 audio_state["run"] = False
+
+            elif mtype == "enable-mic":
+                if not mic_state["run"]:
+                    import queue as _q
+                    import threading
+                    mic_state["q"] = _q.Queue(maxsize=25)
+                    mic_state["run"] = True
+                    threading.Thread(target=mic_player, args=(mic_state["q"],), daemon=True).start()
+                    print("mic enabled")
+
+            elif mtype == "disable-mic":
+                mic_state["run"] = False
 
             elif mtype == "ping":
                 # Latency probe: echo the viewer's timestamp straight back.
@@ -803,6 +856,7 @@ async def connect_once():
                 print("viewer left (explicit)")
                 stream_state["run"] = False
                 audio_state["run"] = False
+                mic_state["run"] = False
                 if pc:
                     await pc.close()
                     pc = None
@@ -812,6 +866,7 @@ async def connect_once():
                 # leaving — stop streaming (it restarts when they reconnect).
                 stream_state["run"] = False
                 audio_state["run"] = False
+                mic_state["run"] = False
                 # For WebRTC, the media is independent of signaling, so a dropped
                 # socket must NOT tear a connected stream down (flaky/filtered
                 # networks would kill a working stream). Only clean up if it
