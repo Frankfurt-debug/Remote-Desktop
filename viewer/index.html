@@ -96,20 +96,15 @@
 
       <div class="grp" style="border-top:0; padding-top:0">
         <h2>Connection</h2>
-        <label class="full" style="font-size:13px;color:#d6d6da">Signaling server <span style="color:var(--dim)">— or a room code</span></label>
-        <input type="text" id="server" placeholder="a room code (e.g. anders) or wss://…" />
-        <div style="font-size:11px;color:var(--dim);margin:2px 0 6px">Type your host's <b>room code</b> and it finds the current tunnel automatically.</div>
-        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:6px">Room</label>
-        <input type="text" id="room" />
-        <div class="field" style="margin-top:10px"><label for="mode">Connection mode</label>
+        <label class="full" style="font-size:13px;color:#d6d6da">Host code <span style="color:var(--dim)">(or a wss:// URL)</span></label>
+        <input type="text" id="server" placeholder="your host's room code — e.g. frankfurt-pc" />
+        <div class="field" style="margin-top:10px"><label for="mode">Mode</label>
           <select id="mode">
-            <option value="webrtc">WebRTC (fast — same network)</option>
-            <option value="gpu">GPU H.264 (best — through filters)</option>
-            <option value="wsvideo">WebSocket JPEG (most compatible)</option>
+            <option value="gpu">GPU H.264 — best</option>
+            <option value="webrtc">WebRTC — lowest latency</option>
+            <option value="wsvideo">JPEG — most compatible</option>
           </select></div>
-        <div class="field"><label for="lanOn">LAN — same WiFi as host (fastest)</label><input type="checkbox" id="lanOn"></div>
-        <div class="field"><label for="relayOn">Force relay (WebRTC only)</label><input type="checkbox" id="relayOn"></div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px">School Chromebook blocked? Use <b>GPU H.264</b> mode.</div>
+        <div class="field"><label for="lanOn">Same WiFi as host (fastest)</label><input type="checkbox" id="lanOn"></div>
       </div>
 
       <div class="grp">
@@ -192,10 +187,10 @@ const sameOrigin = location.host
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host
   : BAKED_URL;
 const DEFAULTS = {
-  server: sameOrigin || BAKED_URL, room: "default",
+  server: location.host ? sameOrigin : "", room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "webrtc", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false,
+  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -206,23 +201,20 @@ function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S))
 
 // Bind form <-> S
 function formToS() {
-  S.server = $("server").value.trim() || BAKED_URL;
-  S.room = $("room").value.trim() || "default";
+  S.server = $("server").value.trim();
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
-  S.relay = $("relayOn").checked;
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
   S.lan = $("lanOn").checked;
 }
 function sToForm() {
-  $("server").value = S.server; $("room").value = S.room;
+  $("server").value = S.server;
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
-  $("relayOn").checked = S.relay;
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
   $("lanOn").checked = S.lan;
@@ -233,7 +225,7 @@ sToForm();
 
 // ---- Connection state -----------------------------------------------------
 let ws, pc, inputChannel, connected = false, settingsOpen = true;
-let wantConnected = false, reconnectTimer = null;
+let wantConnected = false, reconnectTimer = null, effRoom = "default";
 // Adaptive quality: curFps/curScale are the *currently applied* values (start at
 // the user's settings, then auto-adjusted based on measured latency). mediaPing
 // is the latency of the actual video path.
@@ -481,6 +473,9 @@ async function connect() {
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
+  const input = (S.server || "").trim();
+  const isCode = !/^wss?:\/\//i.test(input);
+  effRoom = isCode ? input.toLowerCase() : "default";   // the code IS the room
   const wsUrl = await resolveServer(S.server);
   if (!wantConnected) return;
   if (!wsUrl) {
@@ -494,8 +489,8 @@ async function connect() {
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     dbg("WebSocket OPEN ✓ — signaling reachable", "ok");
-    wsSend({ type: "register", role: "viewer", room: S.room });
-    dbg("Registered as viewer (room: " + S.room + ")");
+    wsSend({ type: "register", role: "viewer", room: effRoom });
+    dbg("Registered as viewer (room: " + effRoom + ")");
     setStatus("waiting for host… (free server can take ~50s to wake)");
     if (isWs()) requestStream();
     // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and

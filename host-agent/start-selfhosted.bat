@@ -13,7 +13,7 @@ set "ROOM=frankfurt-pc"
 
 REM After installing VB-CABLE (vb-audio.com), uncomment the next line for clean
 REM mic with no echo/leak. Then set the game's mic to "CABLE Output".
-REM set "MIC_OUT_DEVICE=CABLE Input"
+set "MIC_OUT_DEVICE=CABLE Input"
 
 echo Starting signaling server on localhost:8080 ...
 start "RD Signaling" /d "%~dp0..\signaling-server" cmd /k node server.js

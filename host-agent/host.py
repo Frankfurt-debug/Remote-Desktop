@@ -505,7 +505,7 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
 async def connect_once():
     global GAME_INPUT
     async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
-        await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM}))
+        await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM.lower()}))
         print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
 
         pc = None
