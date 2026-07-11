@@ -59,6 +59,12 @@ SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
 ROOM = os.environ.get("ROOM", "default")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
+# Self-hosted tunnel + directory: spawn cloudflared, grab the trycloudflare URL,
+# and publish it to the directory server under ROOM so viewers find it by code.
+TUNNEL = os.environ.get("TUNNEL")                 # set to "1" to enable
+LOCAL_PORT = os.environ.get("LOCAL_PORT", "8080")
+DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "wss://remote-desktop-signaling.onrender.com")
+CLOUDFLARED = os.environ.get("CLOUDFLARED", r"C:\Program Files (x86)\cloudflared\cloudflared.exe")
 # Cap the WebRTC send bitrate. Over a bandwidth-limited relay an uncapped
 # encoder overruns the link, frames queue, and latency grows unbounded (mouse
 # lags ~1s). ~2.5 Mbps keeps it responsive; lower it if the relay is slow.
@@ -897,9 +903,73 @@ async def run():
         await asyncio.sleep(3)
 
 
+def lan_ip():
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+async def publish_tunnel():
+    """Spawn cloudflared, extract the trycloudflare URL, and keep publishing it to
+    the directory server under ROOM so viewers can find it by code."""
+    import re
+    import subprocess
+    loop = asyncio.get_event_loop()
+    print("starting Cloudflare tunnel ...")
+    proc = subprocess.Popen(
+        [CLOUDFLARED, "tunnel", "--url", f"http://localhost:{LOCAL_PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    url = None
+    while url is None:
+        line = await loop.run_in_executor(None, proc.stdout.readline)
+        if not line:
+            print("cloudflared exited before giving a URL"); return
+        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+        if m:
+            url = m.group(0).replace("https://", "wss://")
+
+    lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
+    print("\n" + "=" * 56)
+    print(f"  TUNNEL READY.  Viewers connect with ROOM CODE:  {ROOM}")
+    print(f"  (they type '{ROOM}' in the Signaling box)")
+    print(f"  internet URL: {url}")
+    print(f"  same-WiFi:    {lan}  (LAN toggle)")
+    print("=" * 56 + "\n")
+
+    async def drain():                       # keep cloudflared's pipe from filling
+        while True:
+            if not await loop.run_in_executor(None, proc.stdout.readline):
+                break
+    asyncio.create_task(drain())
+
+    while True:                              # publish + refresh in the directory
+        try:
+            async with websockets.connect(DIRECTORY_URL, open_timeout=60) as dws:
+                while True:
+                    await dws.send(json.dumps({"type": "publish-url", "code": ROOM, "url": url, "lan": lan}))
+                    await asyncio.sleep(30)
+        except Exception as e:
+            print(f"directory publish failed ({e}); retrying in 5s")
+            await asyncio.sleep(5)
+
+
+async def amain():
+    tasks = [run()]
+    if TUNNEL:
+        tasks.append(publish_tunnel())
+    await asyncio.gather(*tasks)
+
+
 def main():
     try:
-        asyncio.run(run())
+        asyncio.run(amain())
     except KeyboardInterrupt:
         pass
 

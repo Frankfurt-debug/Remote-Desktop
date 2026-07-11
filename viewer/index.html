@@ -96,9 +96,10 @@
 
       <div class="grp" style="border-top:0; padding-top:0">
         <h2>Connection</h2>
-        <label class="full" style="font-size:13px;color:#d6d6da">Signaling server</label>
-        <input type="text" id="server" />
-        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:8px">Room</label>
+        <label class="full" style="font-size:13px;color:#d6d6da">Signaling server <span style="color:var(--dim)">— or a room code</span></label>
+        <input type="text" id="server" placeholder="a room code (e.g. anders) or wss://…" />
+        <div style="font-size:11px;color:var(--dim);margin:2px 0 6px">Type your host's <b>room code</b> and it finds the current tunnel automatically.</div>
+        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:6px">Room</label>
         <input type="text" id="room" />
         <div class="field" style="margin-top:10px"><label for="mode">Connection mode</label>
           <select id="mode">
@@ -106,8 +107,9 @@
             <option value="gpu">GPU H.264 (best — through filters)</option>
             <option value="wsvideo">WebSocket JPEG (most compatible)</option>
           </select></div>
+        <div class="field"><label for="lanOn">LAN — same WiFi as host (fastest)</label><input type="checkbox" id="lanOn"></div>
         <div class="field"><label for="relayOn">Force relay (WebRTC only)</label><input type="checkbox" id="relayOn"></div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px">School Chromebook blocked? Use <b>WebSocket</b> mode.</div>
+        <div style="font-size:11px;color:var(--dim);margin-top:2px">School Chromebook blocked? Use <b>GPU H.264</b> mode.</div>
       </div>
 
       <div class="grp">
@@ -193,7 +195,7 @@ const DEFAULTS = {
   server: sameOrigin || BAKED_URL, room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "webrtc", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false,
+  mode: "webrtc", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -212,6 +214,7 @@ function formToS() {
   S.relay = $("relayOn").checked;
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
+  S.lan = $("lanOn").checked;
 }
 function sToForm() {
   $("server").value = S.server; $("room").value = S.room;
@@ -222,6 +225,7 @@ function sToForm() {
   $("relayOn").checked = S.relay;
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
+  $("lanOn").checked = S.lan;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -450,7 +454,25 @@ async function networkTest() {
   }
 }
 
-function connect() {
+// A room CODE (not a ws URL) is resolved to the host's current tunnel URL via
+// the directory server — so a changing trycloudflare URL is found by a stable code.
+const DIRECTORY_URL = BAKED_URL;
+function resolveServer(input) {
+  input = (input || "").trim();
+  if (/^wss?:\/\//i.test(input)) return Promise.resolve(input);
+  dbg("Looking up host by code “" + input + "”…");
+  return new Promise((res) => {
+    let done = false;
+    const d = new WebSocket(DIRECTORY_URL);
+    const finish = (u) => { if (!done) { done = true; try { d.close(); } catch {} res(u); } };
+    d.onopen = () => d.send(JSON.stringify({ type: "lookup", code: input }));
+    d.onmessage = (e) => { try { const m = JSON.parse(e.data); if (m.type === "url") finish(S.lan && m.lan ? m.lan : m.url); } catch {} };
+    d.onerror = () => finish(null);
+    setTimeout(() => finish(null), 9000);
+  });
+}
+
+async function connect() {
   wantConnected = true;
   curFps = S.fps; curScale = S.scale; mediaPing = null;
   lagHist = []; baseLag = curLag = null;
@@ -459,8 +481,16 @@ function connect() {
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
-  dbg("Opening WebSocket: " + S.server + (S.mode === "wsvideo" ? "  [WebSocket video mode]" : ""));
-  ws = new WebSocket(S.server);
+  const wsUrl = await resolveServer(S.server);
+  if (!wantConnected) return;
+  if (!wsUrl) {
+    dbg("Host code not found — is the host running (and published)?", "bad");
+    setStatus("host not found for that code");
+    if (!reconnectTimer) reconnectTimer = setTimeout(() => { reconnectTimer = null; if (wantConnected) connect(); }, 4000);
+    return;
+  }
+  dbg("Opening WebSocket: " + wsUrl + (S.mode === "wsvideo" ? "  [WebSocket video mode]" : ""));
+  ws = new WebSocket(wsUrl);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     dbg("WebSocket OPEN ✓ — signaling reachable", "ok");

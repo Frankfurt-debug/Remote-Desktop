@@ -44,6 +44,10 @@ const wss = new WebSocketServer({ server: httpServer });
 
 // room id -> { host: ws|null, viewer: ws|null }
 const rooms = new Map();
+// Directory: a stable code -> the host's current (changing) tunnel URL. Lets a
+// viewer find the host by a memorable code even though the trycloudflare URL
+// changes on every restart.
+const directory = new Map();
 
 function send(ws, obj) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
@@ -68,6 +72,20 @@ wss.on("connection", (ws) => {
     try {
       msg = JSON.parse(data);
     } catch {
+      return;
+    }
+
+    // Directory: host publishes its current tunnel URL under a code.
+    if (msg.type === "publish-url" && msg.code && msg.url) {
+      directory.set(String(msg.code).toLowerCase(), { url: msg.url, lan: msg.lan || null, ts: Date.now() });
+      console.log(`directory: ${msg.code} -> ${msg.url}`);
+      return;
+    }
+    // Viewer looks up a code and gets the current URL(s) back.
+    if (msg.type === "lookup" && msg.code) {
+      const e = directory.get(String(msg.code).toLowerCase());
+      const fresh = e && Date.now() - e.ts < 24 * 3600 * 1000;   // ignore stale entries
+      send(ws, { type: "url", code: msg.code, url: fresh ? e.url : null, lan: fresh ? e.lan : null });
       return;
     }
 
