@@ -249,12 +249,38 @@ def draw_cursor(arr, mon_left: int, mon_top: int) -> None:
 
 
 # ----------------------------------------------------------------------------
-# Screen capture track
+# Screen capture
 # ----------------------------------------------------------------------------
+# CAPTURE = dxcam (DXGI Desktop Duplication — captures fullscreen games /
+# hardware-accelerated content that plain BitBlt shows as black) with an mss
+# (BitBlt) fallback. Set CAPTURE=mss to force the old method.
+CAPTURE = os.environ.get("CAPTURE", "auto").lower()
 _thread_local = threading.local()
+_dxcam = None
+_dxcam_off = (0, 0)
+_dxcam_dead = False
 
 
-def _grab(monitor_index: int):
+def _grab_dxcam(monitor_index: int):
+    global _dxcam, _dxcam_off
+    if _dxcam is None:
+        import dxcam
+        _dxcam = dxcam.create(output_idx=max(0, monitor_index - 1), output_color="RGB")
+        _dxcam.start(target_fps=60, video_mode=True)
+        try:
+            with mss.mss() as s:                       # one-time: monitor offset for cursor
+                m = s.monitors[monitor_index]
+                _dxcam_off = (m["left"], m["top"])
+        except Exception:
+            _dxcam_off = (0, 0)
+        print("capture: dxcam (DXGI) — captures fullscreen games too")
+    frame = _dxcam.get_latest_frame()
+    if frame is None:
+        raise RuntimeError("dxcam returned no frame")
+    return frame.copy(), _dxcam_off[0], _dxcam_off[1]
+
+
+def _grab_mss(monitor_index: int):
     # mss is not thread-safe across threads, so keep one instance per worker thread.
     if not hasattr(_thread_local, "sct"):
         _thread_local.sct = mss.mss()
@@ -264,15 +290,24 @@ def _grab(monitor_index: int):
         shot = sct.grab(mon)
     except Exception:
         # A game switching display mode / resolution can invalidate the capture
-        # handle. Re-create mss (which re-reads the monitor geometry) and retry
-        # once so a single bad grab doesn't kill the stream.
+        # handle. Re-create mss and retry once so one bad grab doesn't kill it.
         _thread_local.sct = mss.mss()
         sct = _thread_local.sct
         mon = sct.monitors[monitor_index]
         shot = sct.grab(mon)
-    # shot.rgb is read-only; .copy() makes it writable so we can paint the cursor.
     arr = np.frombuffer(shot.rgb, dtype=np.uint8).reshape(shot.height, shot.width, 3).copy()
     return arr, mon["left"], mon["top"]
+
+
+def _grab(monitor_index: int):
+    global _dxcam_dead
+    if CAPTURE != "mss" and not _dxcam_dead:
+        try:
+            return _grab_dxcam(monitor_index)
+        except Exception as e:
+            print(f"dxcam capture failed ({e}); falling back to mss")
+            _dxcam_dead = True
+    return _grab_mss(monitor_index)
 
 
 class ScreenTrack(VideoStreamTrack):
