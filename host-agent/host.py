@@ -201,10 +201,23 @@ class _POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
 
-def get_cursor_pos():
-    pt = _POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
-    return pt.x, pt.y
+class _CURSORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("flags", ctypes.c_uint),
+                ("hCursor", ctypes.c_void_p), ("ptScreenPos", _POINT)]
+
+
+CURSOR_SHOWING = 0x1
+
+
+def get_cursor():
+    """Returns (x, y, showing). 'showing' is False when an app has hidden the
+    cursor — e.g. a 3D game grabbing the mouse for look — so we don't paint a
+    phantom pointer over the game on the client."""
+    ci = _CURSORINFO()
+    ci.cbSize = ctypes.sizeof(_CURSORINFO)
+    if ctypes.windll.user32.GetCursorInfo(ctypes.byref(ci)):
+        return ci.ptScreenPos.x, ci.ptScreenPos.y, bool(ci.flags & CURSOR_SHOWING)
+    return 0, 0, True
 
 
 # A classic arrow shape. 'X' = black outline, '.' = white fill, ' ' = transparent.
@@ -234,9 +247,14 @@ _CURSOR_WHITE = [(y, x) for y, row in enumerate(_ARROW) for x, c in enumerate(ro
 
 
 def draw_cursor(arr, mon_left: int, mon_top: int) -> None:
-    cx, cy = get_cursor_pos()
-    rx, ry = cx - mon_left, cy - mon_top
+    cx, cy, showing = get_cursor()
+    if not showing:                       # game hid the cursor — don't draw one
+        return
     h, w, _ = arr.shape
+    # Map the (logical) cursor position onto the captured frame, which may be a
+    # different pixel size (dxcam captures physical pixels / DPI scaling).
+    rx = int((cx - mon_left) * w / max(1, SCREEN_W))
+    ry = int((cy - mon_top) * h / max(1, SCREEN_H))
     if not (0 <= rx < w and 0 <= ry < h):
         return
     for px, val in ((_CURSOR_BLACK, 0), (_CURSOR_WHITE, 255)):
