@@ -648,10 +648,17 @@ async def connect_once():
             while stream_state["run"]:
                 t0 = time.time()
                 try:
+                    arr, ml, mt = await loop.run_in_executor(None, _grab, MONITOR)
+                    if stream_state["cursor"]:
+                        draw_cursor(arr, ml, mt)
+                    # Size the encoder from the ACTUAL captured frame (handles DPI
+                    # scaling and games that switch resolution — the client canvas
+                    # then matches and fills correctly).
+                    cap_h, cap_w = arr.shape[0], arr.shape[1]
                     fps = max(1, min(60, int(stream_state["fps"])))
                     scale = float(stream_state["scale"])
-                    w = max(2, int(SCREEN_W * scale)) & ~1
-                    h = max(2, int(SCREEN_H * scale)) & ~1
+                    w = max(2, int(cap_w * scale)) & ~1
+                    h = max(2, int(cap_h * scale)) & ~1
                     if stream_state.get("force_key"):
                         cur = (0, 0, 0)         # rebuild encoder -> emits a keyframe
                         stream_state["force_key"] = False
@@ -666,9 +673,6 @@ async def connect_once():
                         need_codec_info = True
                         print(f"NVENC: {w}x{h}@{fps} {bitrate // 1000}kbps")
 
-                    arr, ml, mt = await loop.run_in_executor(None, _grab, MONITOR)
-                    if stream_state["cursor"]:
-                        draw_cursor(arr, ml, mt)
                     frame = VideoFrame.from_ndarray(arr, format="rgb24")
                     frame = frame.reformat(width=w, height=h, format="yuv420p")
                     frame.pts = pts
