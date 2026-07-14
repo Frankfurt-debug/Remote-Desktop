@@ -138,6 +138,7 @@
           <input type="range" id="sens" min="0.2" max="3" step="0.1"><span class="val" id="sensV"></span></div>
         <div class="field"><label for="smooth">Smooth movement</label><input type="checkbox" id="smooth"></div>
         <div class="field"><label for="cursor">Show cursor on screen</label><input type="checkbox" id="cursor"></div>
+        <div class="field"><label for="cursorhide">Hide cursor when a game grabs it (3D)</label><input type="checkbox" id="cursorhide"></div>
       </div>
 
       <div class="grp">
@@ -190,7 +191,7 @@ const DEFAULTS = {
   server: location.host ? sameOrigin : "", room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false,
+  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -207,7 +208,7 @@ function formToS() {
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
-  S.lan = $("lanOn").checked;
+  S.lan = $("lanOn").checked; S.cursorhide = $("cursorhide").checked;
 }
 function sToForm() {
   $("server").value = S.server;
@@ -217,7 +218,7 @@ function sToForm() {
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
-  $("lanOn").checked = S.lan;
+  $("lanOn").checked = S.lan; $("cursorhide").checked = S.cursorhide;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -253,7 +254,7 @@ function sendInput(o) {
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(o));
 }
 function sendConfig() {
-  const cfg = { type: "config", fps: curFps, scale: curScale, cursor: S.cursor, quality: S.quality, gameinput: S.gameinput };
+  const cfg = { type: "config", fps: curFps, scale: curScale, cursor: S.cursor, quality: S.quality, gameinput: S.gameinput, cursorhide: S.cursorhide };
   if (isWs()) wsSend(cfg);
   else if (inputChannel && inputChannel.readyState === "open") inputChannel.send(JSON.stringify(cfg));
 }
@@ -536,7 +537,7 @@ async function connect() {
 function requestStream() {
   const codec = S.mode === "gpu" ? "h264" : "jpeg";
   dbg("Requesting " + (codec === "h264" ? "GPU H.264" : "JPEG") + " stream…");
-  wsSend({ type: "start-stream", codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput });
+  wsSend({ type: "start-stream", codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput, cursorhide: S.cursorhide });
   if (S.audio) { setupAudio(); wsSend({ type: "enable-audio" }); }
   if (S.mic) startMic();
 }

@@ -246,9 +246,15 @@ _CURSOR_BLACK = [(y, x) for y, row in enumerate(_ARROW) for x, c in enumerate(ro
 _CURSOR_WHITE = [(y, x) for y, row in enumerate(_ARROW) for x, c in enumerate(row) if c == "."]
 
 
+# When True, hide the drawn cursor if the OS reports it hidden (a 3D game
+# grabbing the mouse). Default False = always draw, because the "hidden" flag is
+# unreliable on some setups. Toggled by the viewer's "Hide cursor in games".
+CURSOR_HIDE = False
+
+
 def draw_cursor(arr, mon_left: int, mon_top: int) -> None:
     cx, cy, showing = get_cursor()
-    if not showing:                       # game hid the cursor — don't draw one
+    if CURSOR_HIDE and not showing:       # opt-in: game hid the cursor
         return
     h, w, _ = arr.shape
     # Map the (logical) cursor position onto the captured frame, which may be a
@@ -556,7 +562,7 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
 
 
 async def connect_once():
-    global GAME_INPUT
+    global GAME_INPUT, CURSOR_HIDE
     async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
         await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM.lower()}))
         print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
@@ -771,7 +777,7 @@ async def connect_once():
                 # Viewer settings (FPS / quality / cursor) arrive as "config";
                 # everything else is mouse/keyboard input.
                 if msg.get("type") == "config":
-                    global GAME_INPUT
+                    global GAME_INPUT, CURSOR_HIDE
                     if "fps" in msg:
                         track.fps = int(msg["fps"])
                     if "scale" in msg:
@@ -780,6 +786,8 @@ async def connect_once():
                         track.show_cursor = bool(msg["cursor"])
                     if "gameinput" in msg:
                         GAME_INPUT = bool(msg["gameinput"])
+                    if "cursorhide" in msg:
+                        CURSOR_HIDE = bool(msg["cursorhide"])
                     print(f"config: fps={track.fps} scale={track.scale} cursor={track.show_cursor} game={GAME_INPUT}")
                 else:
                     handle_input(msg)
@@ -862,6 +870,8 @@ async def connect_once():
                         stream_state[k] = msg[k]
                 if "gameinput" in msg:
                     GAME_INPUT = bool(msg["gameinput"])
+                if "cursorhide" in msg:
+                    CURSOR_HIDE = bool(msg["cursorhide"])
                 stream_state["run"] = True
                 codec = stream_state.get("codec", "jpeg")
                 print(f"start-stream: codec={codec} fps={stream_state['fps']} scale={stream_state['scale']}")
@@ -912,6 +922,8 @@ async def connect_once():
                         stream_state[k] = msg[k]
                 if "gameinput" in msg:
                     GAME_INPUT = bool(msg["gameinput"])
+                if "cursorhide" in msg:
+                    CURSOR_HIDE = bool(msg["cursorhide"])
 
             elif mtype == "leave":
                 # Explicit "I'm leaving" from the viewer (button / page close).
