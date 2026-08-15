@@ -95,18 +95,16 @@
       <p class="sub" id="panelSub">Configure, then connect.</p>
 
       <div class="grp" style="border-top:0; padding-top:0">
-        <h2>Sign in</h2>
-        <label class="full" style="font-size:13px;color:#d6d6da">Username</label>
-        <input type="text" id="user" placeholder="the username shown on the host" autocomplete="off" />
-        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:8px">Password <span style="color:var(--dim)">— the four words</span></label>
-        <input type="text" id="pass" placeholder="students adopted tests kits" autocomplete="off" />
-        <div style="font-size:11px;color:var(--dim);margin:3px 0 6px">Both are printed in the host window. On the same WiFi you can put the host's <b>IP:port</b> here instead.</div>
-        <div class="field" style="margin-top:6px"><label for="mode">Mode</label>
+        <h2>Connection</h2>
+        <label class="full" style="font-size:13px;color:#d6d6da">Host code <span style="color:var(--dim)">(or a wss:// URL)</span></label>
+        <input type="text" id="server" placeholder="your host's room code — e.g. frankfurt-pc" />
+        <div class="field" style="margin-top:10px"><label for="mode">Mode</label>
           <select id="mode">
             <option value="gpu">GPU H.264 — best</option>
             <option value="webrtc">WebRTC — lowest latency</option>
             <option value="wsvideo">JPEG — most compatible</option>
           </select></div>
+        <div class="field"><label for="lanOn">Same WiFi as host (fastest)</label><input type="checkbox" id="lanOn"></div>
       </div>
 
       <div class="grp">
@@ -160,21 +158,7 @@
   </div>
 
 <script>
-// Where to connect. The password is normally the Cloudflare tunnel's four words,
-// which ARE the address: "students adopted tests kits" ->
-// wss://students-adopted-tests-kits.trycloudflare.com. It also accepts a full
-// ws(s):// URL or a bare host:port for same-WiFi use. If this page was served by
-// the host itself, we just talk back to wherever it came from.
-function hostUrl() {
-  const p = (S.pass || "").trim();
-  if (/^wss?:\/\//i.test(p)) return p;
-  if (/^https?:\/\//i.test(p)) return p.replace(/^http/i, "ws");
-  if (/^[\w.-]+:\d+$/.test(p)) return "ws://" + p;               // 192.168.1.9:8080
-  const words = p.toLowerCase().split(/[\s-]+/).filter(Boolean).join("-");
-  if (words) return "wss://" + words + ".trycloudflare.com";
-  if (location.host) return (location.protocol === "https:" ? "wss://" : "ws://") + location.host;
-  return "";
-}
+const BAKED_URL = "wss://remote-desktop-signaling.onrender.com";   // <-- your Render server
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
@@ -200,42 +184,41 @@ function dbg(msg, cls = "") {
 }
 
 // ---- Settings (persisted) -------------------------------------------------
+const sameOrigin = location.host
+  ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host
+  : BAKED_URL;
 const DEFAULTS = {
-  user: "", pass: "",
+  server: location.host ? sameOrigin : "", room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, cursorhide: false,
+  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false,
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
-// URL overrides, e.g. ?user=admin&pass=students+adopted+tests+kits
-if (qs.get("user")) S.user = qs.get("user");
-if (qs.get("pass")) S.pass = qs.get("pass");
+// URL overrides
+if (qs.get("server")) S.server = qs.get("server");
+if (qs.get("room")) S.room = qs.get("room");
 if (qs.get("sens")) S.sens = parseFloat(qs.get("sens"));
-// Don't persist the password — it's the address+secret, keep it session-only.
-function saveSettings() {
-  const { pass, ...rest } = S;
-  localStorage.setItem("rd-settings", JSON.stringify(rest));
-}
+function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S)); }
 
 // Bind form <-> S
 function formToS() {
-  S.user = $("user").value.trim(); S.pass = $("pass").value.trim();
+  S.server = $("server").value.trim();
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
-  S.cursorhide = $("cursorhide").checked;
+  S.lan = $("lanOn").checked; S.cursorhide = $("cursorhide").checked;
 }
 function sToForm() {
-  $("user").value = S.user; $("pass").value = S.pass;
+  $("server").value = S.server;
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
   $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
-  $("cursorhide").checked = S.cursorhide;
+  $("lanOn").checked = S.lan; $("cursorhide").checked = S.cursorhide;
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -243,7 +226,7 @@ sToForm();
 
 // ---- Connection state -----------------------------------------------------
 let ws, pc, inputChannel, connected = false, settingsOpen = true;
-let wantConnected = false, reconnectTimer = null;
+let wantConnected = false, reconnectTimer = null, effRoom = "default";
 // Adaptive quality: curFps/curScale are the *currently applied* values (start at
 // the user's settings, then auto-adjusted based on measured latency). mediaPing
 // is the latency of the actual video path.
@@ -322,7 +305,7 @@ $("webrtcTestBtn").onclick = () => { formToS(); saveSettings(); testWebRTC(); };
 function testWebRTC() {
   debugEl.innerHTML = ""; debugEl.classList.add("show");
   dbg("=== WebRTC BLOCK TEST (host must be running) ===");
-  const tws = new WebSocket(hostUrl()); tws.binaryType = "arraybuffer";
+  const tws = new WebSocket(S.server); tws.binaryType = "arraybuffer";
   let tpc = null, ice = "-", peer = "-", done = false;
   const finish = () => {
     if (done) return; done = true;
@@ -335,19 +318,19 @@ function testWebRTC() {
       dbg("  through the signaling server. Only a relay (TURNS/443) or WS mode helps.", "warn");
     } else {
       dbg("ICE never connected (" + ice + ") — no usable network path / relay.", "bad");
-      dbg("→ Use GPU H.264 mode — it does not need a network path for media.", "warn");
+      dbg("→ Needs a working TURN relay; a different signaling URL won't fix this.", "warn");
     }
     try { tws.send(JSON.stringify({ type: "leave" })); } catch {}
     try { tpc && tpc.close(); } catch {}
     try { tws.close(); } catch {}
   };
-  tws.onopen = () => { dbg("Connected to host ✓", "ok"); tws.send(JSON.stringify({ type: "auth", user: S.user, pass: S.pass, mode: "webrtc" })); };
-  tws.onerror = () => { dbg("Cannot reach host ✗", "bad"); finish(); };
+  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room: S.room })); };
+  tws.onerror = () => { dbg("Signaling: BLOCKED ✗", "bad"); finish(); };
   tws.onmessage = async (ev) => {
     if (ev.data instanceof ArrayBuffer) return;
     const m = JSON.parse(ev.data);
     if (m.type !== "offer") return;
-    dbg("Offer received ✓ (connection + handshake work)", "ok");
+    dbg("Offer received ✓ (signaling + handshake work)", "ok");
     tpc = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: S.relay ? "relay" : "all" });
     tpc.oniceconnectionstatechange = () => { ice = tpc.iceConnectionState; dbg("ICE: " + ice, (ice === "connected" || ice === "completed") ? "ok" : (ice === "failed" ? "bad" : "dim")); };
     tpc.onconnectionstatechange = () => { peer = tpc.connectionState; dbg("Peer: " + peer, peer === "connected" ? "ok" : (peer === "failed" ? "bad" : "dim")); if (peer === "connected" || peer === "failed") setTimeout(finish, 500); };
@@ -402,16 +385,16 @@ async function networkTest() {
   debugEl.innerHTML = ""; debugEl.classList.add("show");
   dbg("=== NETWORK TEST ===");
 
-  // 1. Can we reach the host at all (TLS/WebSocket on 443)?
+  // 1. Signaling reachability (TLS/WebSocket on 443).
   const wsOk = await new Promise((res) => {
     let done = false;
-    const t = new WebSocket(hostUrl());
+    const t = new WebSocket(S.server);
     const finish = (ok) => { if (!done) { done = true; try { t.close(); } catch {} res(ok); } };
     t.onopen = () => finish(true);
     t.onerror = () => finish(false);
     setTimeout(() => finish(false), 8000);
   });
-  dbg(wsOk ? "1. Host connection (WebSocket/443): reachable ✓" : "1. Host connection (WebSocket/443): BLOCKED ✗",
+  dbg(wsOk ? "1. Signaling (WebSocket/443): reachable ✓" : "1. Signaling (WebSocket/443): BLOCKED ✗",
       wsOk ? "ok" : "bad");
 
   // 2. STUN over UDP — do we get a server-reflexive candidate? That proves
@@ -452,20 +435,37 @@ async function networkTest() {
   // Verdict
   dbg("— VERDICT —");
   if (!wsOk) {
-    dbg("The host is unreachable — wrong password/address, host not running,", "bad");
-    dbg("or this network blocks it.", "bad");
+    dbg("Signaling itself is blocked — the server URL is filtered on this network.", "bad");
   } else if (relay) {
     dbg("TURNS relay works! Turn ON 'Force relay' in settings, then Connect —", "ok");
     dbg("the video should now get through. 🎉", "ok");
   } else if (!srflx) {
     dbg("UDP and the TURNS relay are both blocked — this network is very locked down.", "bad");
   } else {
-    dbg("Host reachable and UDP works, but the TURN relay is blocked.", "bad");
-    dbg("Use GPU H.264 mode — it needs none of that.", "bad");
+    dbg("Signaling + UDP work, but the TURNS relay is blocked. The filter is", "bad");
+    dbg("inspecting TLS and rejecting the tunnel. TURNS can't get through here.", "bad");
   }
 }
 
-function connect() {
+// A room CODE (not a ws URL) is resolved to the host's current tunnel URL via
+// the directory server — so a changing trycloudflare URL is found by a stable code.
+const DIRECTORY_URL = BAKED_URL;
+function resolveServer(input) {
+  input = (input || "").trim();
+  if (/^wss?:\/\//i.test(input)) return Promise.resolve(input);
+  dbg("Looking up host by code “" + input + "”…");
+  return new Promise((res) => {
+    let done = false;
+    const d = new WebSocket(DIRECTORY_URL);
+    const finish = (u) => { if (!done) { done = true; try { d.close(); } catch {} res(u); } };
+    d.onopen = () => d.send(JSON.stringify({ type: "lookup", code: input }));
+    d.onmessage = (e) => { try { const m = JSON.parse(e.data); if (m.type === "url") finish(S.lan && m.lan ? m.lan : m.url); } catch {} };
+    d.onerror = () => finish(null);
+    setTimeout(() => finish(null), 9000);
+  });
+}
+
+async function connect() {
   wantConnected = true;
   curFps = S.fps; curScale = S.scale; mediaPing = null;
   lagHist = []; baseLag = curLag = null;
@@ -474,23 +474,28 @@ function connect() {
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
-  const wsUrl = hostUrl();
+  const input = (S.server || "").trim();
+  const isCode = !/^wss?:\/\//i.test(input);
+  effRoom = isCode ? input.toLowerCase() : "default";   // the code IS the room
+  const wsUrl = await resolveServer(S.server);
+  if (!wantConnected) return;
   if (!wsUrl) {
-    dbg("Enter the password (the four words from the host window).", "bad");
-    setStatus("password required");
-    wantConnected = false;
+    dbg("Host code not found — is the host running (and published)?", "bad");
+    setStatus("host not found for that code");
+    if (!reconnectTimer) reconnectTimer = setTimeout(() => { reconnectTimer = null; if (wantConnected) connect(); }, 4000);
     return;
   }
-  dbg("Connecting to " + wsUrl);
+  dbg("Opening WebSocket: " + wsUrl + (S.mode === "wsvideo" ? "  [WebSocket video mode]" : ""));
   ws = new WebSocket(wsUrl);
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
-    dbg("Connected ✓ — signing in…", "ok");
-    // The host is the server now: log in first, everything else follows.
-    wsSend({ type: "auth", user: S.user, pass: S.pass, mode: S.mode });
-    setStatus("signing in…");
+    dbg("WebSocket OPEN ✓ — signaling reachable", "ok");
+    wsSend({ type: "register", role: "viewer", room: effRoom });
+    dbg("Registered as viewer (room: " + effRoom + ")");
+    setStatus("waiting for host… (free server can take ~50s to wake)");
+    if (isWs()) requestStream();
     // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and
-    // some school filters) don't silently close the connection.
+    // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
     ws._ka = setInterval(() => { if (ws.readyState === 1) wsSend({ type: "keepalive" }); }, 15000);
     // Latency probe (round-trip through the server to the host). Frequent so it
@@ -511,25 +516,21 @@ function connect() {
     }
     const m = JSON.parse(ev.data);
     if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
-    else if (m.type === "auth-ok") {
-      dbg("Signed in ✓", "ok");
-      setStatus("starting stream…");
-      if (isWs()) requestStream();      // WebRTC: the host sends its offer itself
-    }
-    else if (m.type === "auth-failed") {
-      dbg("Sign-in REJECTED — check the username and the four words.", "bad");
-      setStatus("wrong username or password");
-      wantConnected = false;            // don't hammer the host with retries
-      teardown();
-    }
     else if (m.type === "codec-info") { setupDecoder(m.codec); }
     else if (m.type === "offer") {
       if (isWs()) return;   // ignore WebRTC in WebSocket modes
       dbg("Offer received from host ✓", "ok"); await handleOffer(m);
     }
+    else if (m.type === "host-ready") { dbg("Host is ready"); if (isWs()) requestStream(); }
+    else if (m.type === "peer-left") {
+      dbg("Host signaling dropped", "warn");
+      // If media is still flowing, keep it (WebRTC is independent of signaling).
+      // Otherwise try to reconnect (e.g. the host restarted).
+      if (!connected) scheduleReconnect();
+    }
   };
-  ws.onclose = () => { clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("disconnected"); };
-  ws.onerror = () => { dbg("Cannot reach the host ✗ — check the password/address, and that the host is running.", "bad"); setStatus("cannot reach host"); };
+  ws.onclose = () => { clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
+  ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
 }
 
 // ---- WebSocket video mode -------------------------------------------------
@@ -929,12 +930,12 @@ async function pollStats() {
       dbg(`No video after 8s. ICE=${ice}, Peer=${peer}`, "bad");
       if (ice === "connected" || ice === "completed") {
         // ICE connected but DTLS never finished = the encrypted media is being
-        // selectively dropped. Connection + STUN pass; the media handshake does not.
+        // selectively dropped. Signaling + STUN pass; the media handshake doesn't.
         dbg("— VERDICT —", "bad");
         dbg("Network path is OPEN (ICE connected) but the encrypted video handshake", "bad");
-        dbg("(DTLS) is being BLOCKED. Connection ✓, STUN ✓, media ✗.", "bad");
-        dbg("Something on this network is filtering peer-to-peer media.", "bad");
-        dbg("Switch to GPU H.264 mode — it streams over the connection that works.", "bad");
+        dbg("(DTLS) is being BLOCKED. Signaling ✓, STUN ✓, media ✗.", "bad");
+        dbg("This is deep-packet-inspection filtering on this device/network", "bad");
+        dbg("(e.g. school management software). Only a TURNS relay on 443 might bypass it.", "bad");
       } else {
         dbg("→ No network path (ICE " + ice + "). This network needs a TURN relay.", "bad");
       }

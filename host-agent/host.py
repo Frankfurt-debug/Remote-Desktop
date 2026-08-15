@@ -1,22 +1,28 @@
 """
-Host agent for the browser remote desktop. Run this on the Windows PC you want
-to control — it is the whole server, there is nothing else to deploy.
+Host agent for the browser remote desktop.
 
-What it does:
-  1. Serves the viewer page and a WebSocket on PORT (default 8080).
-  2. Opens a Cloudflare tunnel, giving the PC a public https address without any
-     port-forwarding. The tunnel's four random words are BOTH the address and
-     the password, so a login is "username + four words".
-  3. Captures the screen (dxcam/DXGI, falls back to mss), encodes with the GPU
-     (NVENC H.264) or JPEG, and streams it to the browser. WebRTC is also
-     available when the network allows it.
-  4. Injects the mouse/keyboard the browser sends back, and carries audio both
-     ways (PC sound out, microphone in).
+Runs on the Windows PC you want to control. Captures the screen with `mss`,
+streams it to the browser over a WebRTC video track (aiortc), and injects the
+mouse/keyboard events the browser sends back over a data channel.
+
+Flow:
+  1. Connect to the signaling server, register as "host".
+  2. When a viewer joins, build the peer connection: add the screen video track
+     and an "input" data channel, create the offer, send it.
+  3. Receive the answer, connection negotiates, video flows host -> browser and
+     input flows browser -> host.
+
+Config is via environment variables (see the constants below) or just edit them.
 
   pip install -r requirements.txt
+  set SIGNALING_URL=wss://your-server.example.com
   python host.py
 
-Config via environment variables — see the constants below.
+Notes:
+  * ICE is non-trickle: aiortc gathers all candidates and embeds them in the
+    SDP, and the browser does the same, so only offer/answer are exchanged.
+  * STUN (Google) is enough for most home networks. If both peers are behind
+    symmetric NAT you must supply a TURN server (set TURN_URL/TURN_USER/TURN_PASS).
 """
 
 import asyncio
@@ -49,17 +55,15 @@ from av import AudioFrame, VideoFrame
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
+SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
+ROOM = os.environ.get("ROOM", "default")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
-# Login. USERNAME is your own secret; the PASSWORD is generated at startup — it
-# is the Cloudflare tunnel's four words, which are also the address the viewer
-# connects to. So the four words say *where*, the username says *who*.
-USERNAME = os.environ.get("USERNAME_RD", "admin")
-PORT = int(os.environ.get("PORT", "8080"))
-TUNNEL_WORDS = None                              # filled in once the tunnel is up
-# Cloudflare tunnel: gives the PC a public https address without port-forwarding.
-# Set TUNNEL=0 to run LAN-only (no internet access, no tunnel).
-TUNNEL = os.environ.get("TUNNEL", "1") != "0"
+# Self-hosted tunnel + directory: spawn cloudflared, grab the trycloudflare URL,
+# and publish it to the directory server under ROOM so viewers find it by code.
+TUNNEL = os.environ.get("TUNNEL")                 # set to "1" to enable
+LOCAL_PORT = os.environ.get("LOCAL_PORT", "8080")
+DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "wss://remote-desktop-signaling.onrender.com")
 CLOUDFLARED = os.environ.get("CLOUDFLARED", r"C:\Program Files (x86)\cloudflared\cloudflared.exe")
 # Cap the WebRTC send bitrate. Over a bandwidth-limited relay an uncapped
 # encoder overruns the link, frames queue, and latency grows unbounded (mouse
@@ -293,7 +297,7 @@ def _grab_dxcam(monitor_index: int):
                 _dxcam_off = (m["left"], m["top"])
         except Exception:
             _dxcam_off = (0, 0)
-        print("capture: dxcam (DXGI) - captures fullscreen games too")
+        print("capture: dxcam (DXGI) — captures fullscreen games too")
     frame = _dxcam.get_latest_frame()
     if frame is None:
         raise RuntimeError("dxcam returned no frame")
@@ -557,40 +561,11 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
     await done
 
 
-def norm_words(s: str) -> str:
-    """'Students Adopted Tests Kits' / 'students-adopted-tests-kits' -> canonical
-    hyphenated form, so the password can be typed however the user likes."""
-    return "-".join(str(s or "").lower().split())
-
-
-async def authenticate(ws) -> dict | None:
-    """First message from a viewer must be {"type":"auth","user":…,"pass":…}.
-    The password is the tunnel's four words. Returns the message, or None."""
-    try:
-        raw = await asyncio.wait_for(ws.recv(), timeout=15)
-        msg = json.loads(raw)
-    except Exception:
-        return None
-    ok_user = str(msg.get("user", "")).strip().lower() == USERNAME.strip().lower()
-    # If no tunnel (LAN-only), any password is accepted — the LAN is the boundary.
-    ok_pass = TUNNEL_WORDS is None or norm_words(msg.get("pass")) == TUNNEL_WORDS
-    if msg.get("type") != "auth" or not (ok_user and ok_pass):
-        print(f"login REJECTED (user={msg.get('user')!r})")
-        try:
-            await ws.send(json.dumps({"type": "auth-failed"}))
-        except Exception:
-            pass
-        return None
-    await ws.send(json.dumps({"type": "auth-ok"}))
-    print(f"login OK: {msg.get('user')}")
-    return msg
-
-
-async def handle_viewer(ws):
+async def connect_once():
     global GAME_INPUT, CURSOR_HIDE
-    hello = await authenticate(ws)
-    if hello:
-        print(f"viewer connected. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}.")
+    async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
+        await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM.lower()}))
+        print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
 
         pc = None
 
@@ -834,18 +809,13 @@ async def handle_viewer(ws):
             ]
             print("host ICE candidates:", cand_types or ["(none)"])
             if "relay" not in cand_types:
-                print("  ! NO relay candidate - TURN allocation failed; forced-relay wont connect.")
+                print("  ⚠ NO relay candidate — TURN allocation failed; forced-relay won't connect.")
 
             await ws.send(json.dumps({
                 "type": "offer",
                 "sdp": pc.localDescription.sdp,
             }))
             print("offer sent")
-
-        # The viewer talks to us directly now (no broker), so if it wants WebRTC
-        # we start the offer as soon as it logs in.
-        if hello.get("mode") == "webrtc":
-            asyncio.create_task(new_peer_connection())
 
         async for raw in ws:
             # Binary from the viewer = microphone audio (tagged 0x04).
@@ -977,12 +947,29 @@ async def handle_viewer(ws):
                 # networks would kill a working stream). Only clean up if it
                 # never actually connected.
                 if pc and pc.connectionState == "connected":
-                    print("viewer signaling dropped - media still connected, keeping it alive")
+                    print("viewer signaling dropped — media still connected, keeping it alive")
                 else:
                     print("viewer left")
                     if pc:
                         await pc.close()
                         pc = None
+
+
+async def run():
+    # Reconnect loop: Render's free tier sleeps when idle and returns 404 until
+    # it wakes (~50s), so the first connection often fails. Keep retrying; this
+    # also recovers automatically if the signaling server restarts.
+    print(f"Connecting to {SIGNALING_URL} (room={ROOM}) ...")
+    print("(If the signaling server is asleep, the first attempt can take up to a minute.)")
+    while True:
+        try:
+            await connect_once()
+            print("signaling connection closed; reconnecting in 3s...")
+        except (OSError, websockets.exceptions.WebSocketException) as e:
+            print(f"could not reach signaling server ({e}); retrying in 5s...")
+            await asyncio.sleep(5)
+            continue
+        await asyncio.sleep(3)
 
 
 def lan_ip():
@@ -997,94 +984,63 @@ def lan_ip():
         s.close()
 
 
-async def start_tunnel():
-    """Spawn cloudflared and pull out the public URL. Its four random words become
-    the password AND the address, so there is no server to run anywhere else."""
-    global TUNNEL_WORDS
+async def publish_tunnel():
+    """Spawn cloudflared, extract the trycloudflare URL, and keep publishing it to
+    the directory server under ROOM so viewers can find it by code."""
     import re
     import subprocess
     loop = asyncio.get_event_loop()
-    print("Starting Cloudflare tunnel ...")
-    try:
-        proc = subprocess.Popen(
-            [CLOUDFLARED, "tunnel", "--url", f"http://localhost:{PORT}"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-        )
-    except FileNotFoundError:
-        print(f"cloudflared not found at {CLOUDFLARED}\n"
-              "Install it (winget install Cloudflare.cloudflared) or set TUNNEL=0 for LAN-only.")
-        return None
-    while True:
+    print("starting Cloudflare tunnel ...")
+    proc = subprocess.Popen(
+        [CLOUDFLARED, "tunnel", "--url", f"http://localhost:{LOCAL_PORT}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    )
+    url = None
+    while url is None:
         line = await loop.run_in_executor(None, proc.stdout.readline)
         if not line:
-            print("cloudflared exited before giving a URL")
-            return None
-        m = re.search(r"https://([a-z0-9-]+)\.trycloudflare\.com", line)
+            print("cloudflared exited before giving a URL"); return
+        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
         if m:
-            TUNNEL_WORDS = m.group(1)
-            break
+            url = m.group(0).replace("https://", "wss://")
+
+    lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
+    print("\n" + "=" * 56)
+    print(f"  TUNNEL READY.  Viewers connect with ROOM CODE:  {ROOM}")
+    print(f"  (they type '{ROOM}' in the Signaling box)")
+    print(f"  internet URL: {url}")
+    print(f"  same-WiFi:    {lan}  (LAN toggle)")
+    print("=" * 56 + "\n")
 
     async def drain():                       # keep cloudflared's pipe from filling
         while True:
             if not await loop.run_in_executor(None, proc.stdout.readline):
                 break
     asyncio.create_task(drain())
-    return TUNNEL_WORDS
 
-
-def print_login():
-    bar = "=" * 60
-    print("\n" + bar)
-    print("  REMOTE DESKTOP IS READY - use these to log in from the client")
-    print(bar)
-    print(f"   Username:  {USERNAME}")
-    if TUNNEL_WORDS:
-        print(f"   Password:  {TUNNEL_WORDS.replace('-', ' ')}")
-        print(f"\n   Or open directly: https://{TUNNEL_WORDS}.trycloudflare.com")
-    else:
-        print("   Password:  (any - LAN-only mode)")
-    print(f"   Same WiFi: http://{lan_ip()}:{PORT}")
-    print(bar)
-    print("  Keep this window open. Ctrl+C to stop sharing.\n")
-
-
-VIEWER_HTML = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                           "viewer", "index.html")
-
-
-async def serve_page(connection, request):
-    """Serve the viewer page for ordinary GETs; let WebSocket upgrades through."""
-    if request.headers.get("Upgrade", "").lower() == "websocket":
-        return None
-    try:
-        with open(VIEWER_HTML, "rb") as f:
-            body = f.read()
-    except OSError:
-        return connection.respond(404, "viewer/index.html not found\n")
-    from websockets.datastructures import Headers
-    from websockets.http11 import Response
-    return Response(200, "OK", Headers({
-        "Content-Type": "text/html; charset=utf-8",
-        "Content-Length": str(len(body)),
-        "Cache-Control": "no-store",
-    }), body)
+    while True:                              # publish + refresh in the directory
+        try:
+            async with websockets.connect(DIRECTORY_URL, open_timeout=60) as dws:
+                while True:
+                    await dws.send(json.dumps({"type": "publish-url", "code": ROOM, "url": url, "lan": lan}))
+                    await asyncio.sleep(30)
+        except Exception as e:
+            print(f"directory publish failed ({e}); retrying in 5s")
+            await asyncio.sleep(5)
 
 
 async def amain():
-    from websockets.asyncio.server import serve
+    tasks = [run()]
     if TUNNEL:
-        await start_tunnel()
-    print_login()
-    async with serve(handle_viewer, "0.0.0.0", PORT, max_size=None,
-                     process_request=serve_page):
-        await asyncio.Future()               # serve forever
+        tasks.append(publish_tunnel())
+    await asyncio.gather(*tasks)
 
 
 def main():
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        pass
 
 
 if __name__ == "__main__":

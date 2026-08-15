@@ -1,0 +1,12 @@
+{
+  "name": "remote-desktop-signaling",
+  "version": "1.0.0",
+  "description": "WebRTC signaling broker for the browser remote desktop",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
