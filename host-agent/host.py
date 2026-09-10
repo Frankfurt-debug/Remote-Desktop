@@ -15,22 +15,31 @@ Flow:
 Config is via environment variables (see the constants below) or just edit them.
 
   pip install -r requirements.txt
+  set ACCESS_KEY=some-long-shared-passphrase
   set SIGNALING_URL=wss://your-server.example.com
   python host.py
 
 Notes:
+  * ACCESS_KEY is required. The viewer must answer a challenge derived from it
+    before this agent streams anything or injects a single keystroke, and the
+    key itself never crosses the wire.
   * ICE is non-trickle: aiortc gathers all candidates and embeds them in the
     SDP, and the browser does the same, so only offer/answer are exchanged.
   * STUN (Google) is enough for most home networks. If both peers are behind
-    symmetric NAT you must supply a TURN server (set TURN_URL/TURN_USER/TURN_PASS).
+    symmetric NAT you must supply your own TURN server (TURN_URL/TURN_USER/
+    TURN_PASS). No relay credentials ship with this repo.
 """
 
 import asyncio
 import ctypes
 import fractions
+import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -57,22 +66,35 @@ from av import AudioFrame, VideoFrame
 # ----------------------------------------------------------------------------
 SIGNALING_URL = os.environ.get("SIGNALING_URL", "ws://localhost:8080")
 ROOM = os.environ.get("ROOM", "default")
+# Shared secret. The viewer must prove it knows this before the host will stream
+# the screen or accept a single keystroke. There is deliberately no default: a
+# host with no key refuses to start (see main()), because anyone who reached the
+# signaling server would otherwise own this machine.
+ACCESS_KEY = os.environ.get("ACCESS_KEY", "")
 MONITOR = int(os.environ.get("MONITOR", "1"))   # mss monitor index (1 = primary)
 FPS = int(os.environ.get("FPS", "30"))
 # Self-hosted tunnel + directory: spawn cloudflared, grab the trycloudflare URL,
-# and publish it to the directory server under ROOM so viewers find it by code.
+# and publish it to the directory server so viewers find it by code. Set
+# DIRECTORY_URL to your own server; empty means "don't publish anywhere".
 TUNNEL = os.environ.get("TUNNEL")                 # set to "1" to enable
 LOCAL_PORT = os.environ.get("LOCAL_PORT", "8080")
-DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "wss://remote-desktop-signaling.onrender.com")
-CLOUDFLARED = os.environ.get("CLOUDFLARED", r"C:\Program Files (x86)\cloudflared\cloudflared.exe")
+DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "")
+CLOUDFLARED = (
+    os.environ.get("CLOUDFLARED")
+    or shutil.which("cloudflared")
+    or r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
+)
 # Cap the WebRTC send bitrate. Over a bandwidth-limited relay an uncapped
 # encoder overruns the link, frames queue, and latency grows unbounded (mouse
 # lags ~1s). ~2.5 Mbps keeps it responsive; lower it if the relay is slow.
 MAX_BITRATE_KBPS = int(os.environ.get("MAX_BITRATE_KBPS", "2500"))
 
+# TURN relay, for when both peers are behind symmetric NAT. Bring your own —
+# credentials belong in the environment, never in the repo.
 TURN_URL = os.environ.get("TURN_URL")           # e.g. turn:turn.example.com:3478
 TURN_USER = os.environ.get("TURN_USER")
 TURN_PASS = os.environ.get("TURN_PASS")
+STUN_URL = os.environ.get("STUN_URL", "stun:stun.l.google.com:19302")
 
 # Make the process DPI-aware so screen capture, cursor position and pyautogui
 # all agree on physical pixels (otherwise the drawn cursor and clicks drift on
@@ -88,6 +110,47 @@ pyautogui.FAILSAFE = False
 
 SCREEN_W, SCREEN_H = pyautogui.size()
 VIDEO_CLOCK_RATE = 90000
+
+
+# ----------------------------------------------------------------------------
+# Access control
+#
+# Everything below is derived from ACCESS_KEY, which never crosses the wire:
+#
+#   wire_room()  the room id the signaling server sees. Hashing it means someone
+#                who guesses your room code still can't join the room, and can't
+#                register as a fake "host" to harvest the viewer's keystrokes.
+#   dir_key()    the directory entry name, so a stranger can't look up a code and
+#                get back the host's current tunnel URL.
+#   auth_proof() the challenge response. The host sends a fresh random nonce, the
+#                viewer returns HMAC(key, nonce), so the key itself is never sent
+#                and a captured response can't be replayed.
+# ----------------------------------------------------------------------------
+# Drop the signaling connection after this many wrong keys on one socket.
+MAX_AUTH_FAILS = int(os.environ.get("MAX_AUTH_FAILS", "5"))
+
+
+def _digest(label: str, *parts: str) -> str:
+    h = hashlib.sha256()
+    h.update(label.encode())
+    for part in parts:
+        h.update(b"|")
+        h.update(part.encode())
+    return h.hexdigest()
+
+
+def wire_room(room: str, key: str) -> str:
+    return _digest("rd-room", room.lower(), key)
+
+
+def dir_key(code: str, key: str) -> str:
+    return _digest("rd-dir", code.lower(), key)
+
+
+def auth_proof(room: str, key: str, nonce: str) -> str:
+    msg = f"rd-auth|{room.lower()}|{nonce}".encode()
+    return hmac.new(key.encode(), msg, hashlib.sha256).hexdigest()
+
 
 # ----------------------------------------------------------------------------
 # Raw relative mouse movement via Win32 SendInput.
@@ -485,20 +548,14 @@ def handle_input(msg: dict) -> None:
 # WebRTC + signaling
 # ----------------------------------------------------------------------------
 def build_ice_servers():
-    servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+    """STUN is enough for most home networks. A TURN relay is only needed when
+    both peers sit behind symmetric NAT; supply your own via TURN_URL /
+    TURN_USER / TURN_PASS. No relay credentials are shipped with this repo."""
+    servers = [RTCIceServer(urls=[STUN_URL])]
     if TURN_URL:
-        # User-supplied TURN overrides the default.
         servers.append(RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS))
     else:
-        # Metered TURN relay so the host allocates a relay candidate the viewer
-        # can reach. Use plain UDP only — the host is on an unfiltered network, and
-        # aioice's TURN channel-binding is most reliable over UDP (the TCP/TLS
-        # transports were throwing 401s on channel-bind and breaking the relay).
-        servers.append(RTCIceServer(
-            urls=["turn:global.relay.metered.ca:80"],
-            username="36292581ea281c3ca146486f",
-            credential="VOadz1IOJqzHUZRa",
-        ))
+        print("no TURN configured — set TURN_URL/TURN_USER/TURN_PASS if a relay is needed")
     return servers
 
 
@@ -564,10 +621,15 @@ async def wait_ice_gathering_complete(pc: RTCPeerConnection) -> None:
 async def connect_once():
     global GAME_INPUT, CURSOR_HIDE
     async with websockets.connect(SIGNALING_URL, max_size=None, open_timeout=90) as ws:
-        await ws.send(json.dumps({"type": "register", "role": "host", "room": ROOM.lower()}))
+        await ws.send(json.dumps({
+            "type": "register", "role": "host", "room": wire_room(ROOM, ACCESS_KEY),
+        }))
         print(f"Registered as host. Screen {SCREEN_W}x{SCREEN_H}, monitor {MONITOR}, {FPS} fps.")
 
         pc = None
+        # Per-connection access state. Reset whenever a viewer joins or leaves,
+        # so a new viewer always has to prove the key again.
+        auth = {"ok": False, "nonce": None, "fails": 0}
 
         # --- WebSocket video streaming (fallback for networks that block WebRTC) ---
         # Instead of WebRTC/DTLS, capture -> JPEG -> send as binary over the same
@@ -820,7 +882,7 @@ async def connect_once():
         async for raw in ws:
             # Binary from the viewer = microphone audio (tagged 0x04).
             if isinstance(raw, (bytes, bytearray)):
-                if raw and raw[0] == 4 and mic_state["run"] and mic_state["q"] is not None:
+                if auth["ok"] and raw and raw[0] == 4 and mic_state["run"] and mic_state["q"] is not None:
                     try:
                         mic_state["q"].put_nowait(bytes(raw[1:]))
                     except Exception:
@@ -831,12 +893,43 @@ async def connect_once():
             mtype = msg.get("type")
 
             if mtype == "viewer-joined":
-                print("viewer joined")
-                # Run concurrently so a slow WebRTC ICE gather can't block the
-                # loop from handling a WebSocket-mode viewer's start-stream.
-                asyncio.create_task(new_peer_connection())
+                # A viewer is in the room, but it is a stranger until it answers
+                # the challenge. Nothing is captured or injected before then.
+                auth.update(ok=False, nonce=secrets.token_hex(16))
+                print("viewer joined — asking for the access key")
+                await ws.send(json.dumps({"type": "auth-challenge", "nonce": auth["nonce"]}))
+                continue
 
-            elif mtype == "answer":
+            if mtype == "auth-response":
+                if auth["ok"]:
+                    continue
+                expected = auth_proof(ROOM, ACCESS_KEY, auth["nonce"] or "")
+                got = str(msg.get("proof", ""))
+                if auth["nonce"] and hmac.compare_digest(got, expected):
+                    auth.update(ok=True, nonce=None, fails=0)
+                    print("viewer authenticated ✓")
+                    await ws.send(json.dumps({"type": "auth-ok"}))
+                    # Run concurrently so a slow WebRTC ICE gather can't block the
+                    # loop from handling a WebSocket-mode viewer's start-stream.
+                    asyncio.create_task(new_peer_connection())
+                else:
+                    auth["fails"] += 1
+                    auth["nonce"] = secrets.token_hex(16)      # one nonce per try
+                    print(f"WRONG ACCESS KEY from viewer (attempt {auth['fails']})")
+                    await ws.send(json.dumps({"type": "auth-failed", "nonce": auth["nonce"]}))
+                    # Back off so the key can't be brute-forced at wire speed.
+                    await asyncio.sleep(min(5, auth["fails"]))
+                    if auth["fails"] >= MAX_AUTH_FAILS:
+                        print("too many bad keys — dropping this signaling connection")
+                        await ws.close()
+                        break
+                continue
+
+            if not auth["ok"] and mtype not in ("peer-left", "leave"):
+                # Unauthenticated: no offer, no stream, no input, no audio.
+                continue
+
+            if mtype == "answer":
                 if pc:
                     sdp = cap_video_bitrate(msg["sdp"], MAX_BITRATE_KBPS)
                     await pc.setRemoteDescription(
@@ -929,6 +1022,7 @@ async def connect_once():
                 # Explicit "I'm leaving" from the viewer (button / page close).
                 # Always tear down cleanly so the next connection starts fresh.
                 print("viewer left (explicit)")
+                auth.update(ok=False, nonce=None)
                 stream_state["run"] = False
                 audio_state["run"] = False
                 mic_state["run"] = False
@@ -939,6 +1033,7 @@ async def connect_once():
             elif mtype == "peer-left":
                 # WS-video rides this socket, so it can't survive the viewer
                 # leaving — stop streaming (it restarts when they reconnect).
+                auth.update(ok=False, nonce=None)
                 stream_state["run"] = False
                 audio_state["run"] = False
                 mic_state["run"] = False
@@ -956,9 +1051,10 @@ async def connect_once():
 
 
 async def run():
-    # Reconnect loop: Render's free tier sleeps when idle and returns 404 until
-    # it wakes (~50s), so the first connection often fails. Keep retrying; this
-    # also recovers automatically if the signaling server restarts.
+    # Reconnect loop. Free hosting tiers sleep when idle and return 404 until
+    # they wake (~50s), so the first connection often fails. Keep retrying; this
+    # also recovers automatically if the signaling server restarts, and after a
+    # connection is dropped for too many wrong access keys.
     print(f"Connecting to {SIGNALING_URL} (room={ROOM}) ...")
     print("(If the signaling server is asleep, the first attempt can take up to a minute.)")
     while True:
@@ -986,7 +1082,9 @@ def lan_ip():
 
 async def publish_tunnel():
     """Spawn cloudflared, extract the trycloudflare URL, and keep publishing it to
-    the directory server under ROOM so viewers can find it by code."""
+    the directory server so viewers can find it by code. The entry is filed under
+    a hash of (code + access key), so knowing the code alone is not enough to
+    resolve it to this machine's tunnel."""
     import re
     import subprocess
     loop = asyncio.get_event_loop()
@@ -1018,11 +1116,16 @@ async def publish_tunnel():
                 break
     asyncio.create_task(drain())
 
+    if not DIRECTORY_URL:
+        print("DIRECTORY_URL not set — not publishing. Give viewers the URL above.")
+        await asyncio.Event().wait()
+
+    entry = dir_key(ROOM, ACCESS_KEY)
     while True:                              # publish + refresh in the directory
         try:
             async with websockets.connect(DIRECTORY_URL, open_timeout=60) as dws:
                 while True:
-                    await dws.send(json.dumps({"type": "publish-url", "code": ROOM, "url": url, "lan": lan}))
+                    await dws.send(json.dumps({"type": "publish-url", "code": entry, "url": url, "lan": lan}))
                     await asyncio.sleep(30)
         except Exception as e:
             print(f"directory publish failed ({e}); retrying in 5s")
@@ -1037,6 +1140,19 @@ async def amain():
 
 
 def main():
+    if len(ACCESS_KEY) < 12:
+        print("=" * 68)
+        print("  REFUSING TO START: no ACCESS_KEY (or one shorter than 12 chars).")
+        print()
+        print("  This agent hands full mouse and keyboard control of this PC to")
+        print("  whoever connects. Without a key, that is anyone who finds the")
+        print("  server. Set one, and give the same key to the person viewing:")
+        print()
+        print("      set ACCESS_KEY=" + "-".join(secrets.token_hex(3) for _ in range(4)))
+        print()
+        print("  (that is a freshly generated suggestion — any long passphrase works)")
+        print("=" * 68)
+        raise SystemExit(1)
     try:
         asyncio.run(amain())
     except KeyboardInterrupt:

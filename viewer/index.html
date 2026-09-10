@@ -97,7 +97,13 @@
       <div class="grp" style="border-top:0; padding-top:0">
         <h2>Connection</h2>
         <label class="full" style="font-size:13px;color:#d6d6da">Host code <span style="color:var(--dim)">(or a wss:// URL)</span></label>
-        <input type="text" id="server" placeholder="your host's room code — e.g. frankfurt-pc" />
+        <input type="text" id="server" placeholder="the host's room code" />
+        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:10px">Access key <span style="color:var(--dim)">(required — same one the host set)</span></label>
+        <input type="password" id="key" placeholder="shared passphrase from the host" autocomplete="off" />
+        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:10px">Directory server <span style="color:var(--dim)">(only needed to look up a code)</span></label>
+        <input type="text" id="directory" placeholder="wss://your-own-server.example.com" />
+        <label class="full" style="font-size:13px;color:#d6d6da;margin-top:10px">TURN relay <span style="color:var(--dim)">(optional — urls|user|pass)</span></label>
+        <input type="text" id="turn" placeholder="turns:relay.example.com:443?transport=tcp|user|pass" autocomplete="off" />
         <div class="field" style="margin-top:10px"><label for="mode">Mode</label>
           <select id="mode">
             <option value="gpu">GPU H.264 — best</option>
@@ -158,7 +164,11 @@
   </div>
 
 <script>
-const BAKED_URL = "wss://remote-desktop-signaling.onrender.com";   // <-- your Render server
+// Optional fallback signaling/directory server, used when this page is opened
+// from a file:// URL and the user typed a room code rather than a wss:// URL.
+// Leave it empty and set the directory server in the connection panel (or with
+// ?directory=wss://...) so no one else's server is baked into this file.
+const BAKED_URL = "";
 const qs = new URLSearchParams(location.search);
 const $ = (id) => document.getElementById(id);
 const video = $("video"), canvas = $("canvas"), overlay = $("overlay"), hud = $("hud"), statusEl = $("status"), debugEl = $("debug");
@@ -183,12 +193,83 @@ function dbg(msg, cls = "") {
   console.log("[rd]", msg);
 }
 
+// ---- SHA-256 / HMAC -------------------------------------------------------
+// Written out longhand rather than using crypto.subtle, which is undefined on a
+// plain-http origin — exactly the LAN case (http://192.168.x.x) this viewer has
+// to work on. Used to derive the room id, the directory entry and the challenge
+// response, so the access key itself is never put on the wire.
+const SHA_K = new Uint32Array([
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+]);
+const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+
+function sha256(msg) {
+  const bitLen = msg.length * 8;
+  const buf = new Uint8Array(((((msg.length + 8) >> 6) + 1) << 6));
+  buf.set(msg);
+  buf[msg.length] = 0x80;
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(buf.length - 8, Math.floor(bitLen / 4294967296));
+  dv.setUint32(buf.length - 4, bitLen >>> 0);
+  const H = new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+  const w = new Uint32Array(64);
+  for (let off = 0; off < buf.length; off += 64) {
+    for (let i = 0; i < 16; i++) w[i] = dv.getUint32(off + i * 4);
+    for (let i = 16; i < 64; i++) {
+      const s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >>> 3);
+      const s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >>> 10);
+      w[i] = (w[i-16] + s0 + w[i-7] + s1) >>> 0;
+    }
+    let a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+    for (let i = 0; i < 64; i++) {
+      const t1 = (h + (rotr(e,6) ^ rotr(e,11) ^ rotr(e,25)) + ((e & f) ^ (~e & g)) + SHA_K[i] + w[i]) >>> 0;
+      const t2 = ((rotr(a,2) ^ rotr(a,13) ^ rotr(a,22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    H[0] = (H[0]+a) >>> 0; H[1] = (H[1]+b) >>> 0; H[2] = (H[2]+c) >>> 0; H[3] = (H[3]+d) >>> 0;
+    H[4] = (H[4]+e) >>> 0; H[5] = (H[5]+f) >>> 0; H[6] = (H[6]+g) >>> 0; H[7] = (H[7]+h) >>> 0;
+  }
+  const out = new Uint8Array(32), odv = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) odv.setUint32(i * 4, H[i]);
+  return out;
+}
+
+const utf8 = (str) => new TextEncoder().encode(str);
+const toHex = (bytes) => Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a); out.set(b, a.length);
+  return out;
+}
+
+function hmacSha256(keyBytes, msgBytes) {
+  let k = keyBytes.length > 64 ? sha256(keyBytes) : keyBytes;
+  const block = new Uint8Array(64); block.set(k);
+  const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) { ipad[i] = block[i] ^ 0x36; opad[i] = block[i] ^ 0x5c; }
+  return sha256(concatBytes(opad, sha256(concatBytes(ipad, msgBytes))));
+}
+
+// Must stay byte-for-byte identical to _digest/auth_proof in host-agent/host.py.
+const digest = (label, ...parts) => toHex(sha256(utf8(label + parts.map((p) => "|" + p).join(""))));
+const wireRoom = (room, key) => digest("rd-room", room.toLowerCase(), key);
+const dirKey = (code, key) => digest("rd-dir", code.toLowerCase(), key);
+const authProof = (room, key, nonce) =>
+  toHex(hmacSha256(utf8(key), utf8("rd-auth|" + room.toLowerCase() + "|" + nonce)));
+
 // ---- Settings (persisted) -------------------------------------------------
 const sameOrigin = location.host
   ? (location.protocol === "https:" ? "wss://" : "ws://") + location.host
   : BAKED_URL;
 const DEFAULTS = {
-  server: location.host ? sameOrigin : "", room: "default",
+  server: location.host ? sameOrigin : "", room: "default", key: "", directory: "", turn: "",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
   mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false,
@@ -197,12 +278,25 @@ let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings
 // URL overrides
 if (qs.get("server")) S.server = qs.get("server");
 if (qs.get("room")) S.room = qs.get("room");
+if (qs.get("directory")) S.directory = qs.get("directory");
+if (qs.get("turn")) S.turn = qs.get("turn");
 if (qs.get("sens")) S.sens = parseFloat(qs.get("sens"));
-function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S)); }
+// The access key is intentionally NOT accepted from the URL: query strings end
+// up in history, bookmarks and shoulder-surfing range. Type it in the panel.
+// Persist everything except the access key — a shared secret does not belong in
+// localStorage, where any script on this origin (or the next person at this
+// machine) can read it. It is kept in memory for this tab only.
+function saveSettings() {
+  const { key, ...rest } = S;
+  localStorage.setItem("rd-settings", JSON.stringify(rest));
+}
 
 // Bind form <-> S
 function formToS() {
   S.server = $("server").value.trim();
+  S.key = $("key").value;
+  S.directory = $("directory").value.trim();
+  S.turn = $("turn").value.trim();
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
   S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
@@ -212,6 +306,9 @@ function formToS() {
 }
 function sToForm() {
   $("server").value = S.server;
+  $("key").value = S.key || "";
+  $("directory").value = S.directory || "";
+  $("turn").value = S.turn || "";
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
@@ -227,6 +324,8 @@ sToForm();
 // ---- Connection state -----------------------------------------------------
 let ws, pc, inputChannel, connected = false, settingsOpen = true;
 let wantConnected = false, reconnectTimer = null, effRoom = "default";
+// True only once the host has accepted our answer to its access-key challenge.
+let authed = false;
 // Adaptive quality: curFps/curScale are the *currently applied* values (start at
 // the user's settings, then auto-adjusted based on measured latency). mediaPing
 // is the latency of the actual video path.
@@ -305,6 +404,11 @@ $("webrtcTestBtn").onclick = () => { formToS(); saveSettings(); testWebRTC(); };
 function testWebRTC() {
   debugEl.innerHTML = ""; debugEl.classList.add("show");
   dbg("=== WebRTC BLOCK TEST (host must be running) ===");
+  if (!S.key) { dbg("Enter the access key first — the host won't answer without it.", "bad"); return; }
+  if (!/^wss?:\/\//i.test((S.server || "").trim())) {
+    dbg("This test needs the host's wss:// URL, not a room code.", "bad"); return;
+  }
+  const testRoom = (/^wss?:\/\//i.test(S.server) ? (S.room || "default") : S.server).toLowerCase();
   const tws = new WebSocket(S.server); tws.binaryType = "arraybuffer";
   let tpc = null, ice = "-", peer = "-", done = false;
   const finish = () => {
@@ -324,14 +428,20 @@ function testWebRTC() {
     try { tpc && tpc.close(); } catch {}
     try { tws.close(); } catch {}
   };
-  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room: S.room })); };
+  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room: wireRoom(testRoom, S.key) })); };
   tws.onerror = () => { dbg("Signaling: BLOCKED ✗", "bad"); finish(); };
   tws.onmessage = async (ev) => {
     if (ev.data instanceof ArrayBuffer) return;
     const m = JSON.parse(ev.data);
+    if (m.type === "auth-challenge") {
+      tws.send(JSON.stringify({ type: "auth-response", proof: authProof(testRoom, S.key, m.nonce) }));
+      return;
+    }
+    if (m.type === "auth-failed") { dbg("Access key rejected by the host ✗", "bad"); finish(); return; }
+    if (m.type === "auth-ok") { dbg("Access key accepted ✓ — waiting for the offer", "ok"); return; }
     if (m.type !== "offer") return;
     dbg("Offer received ✓ (signaling + handshake work)", "ok");
-    tpc = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: S.relay ? "relay" : "all" });
+    tpc = new RTCPeerConnection({ iceServers: buildIce(), iceTransportPolicy: S.relay ? "relay" : "all" });
     tpc.oniceconnectionstatechange = () => { ice = tpc.iceConnectionState; dbg("ICE: " + ice, (ice === "connected" || ice === "completed") ? "ok" : (ice === "failed" ? "bad" : "dim")); };
     tpc.onconnectionstatechange = () => { peer = tpc.connectionState; dbg("Peer: " + peer, peer === "connected" ? "ok" : (peer === "failed" ? "bad" : "dim")); if (peer === "connected" || peer === "failed") setTimeout(finish, 500); };
     tpc.onicecandidate = (e) => { if (e.candidate) tws.send(JSON.stringify({ type: "ice", candidate: { candidate: e.candidate.candidate, sdpMid: e.candidate.sdpMid, sdpMLineIndex: e.candidate.sdpMLineIndex } })); };
@@ -365,17 +475,21 @@ function toggleFullscreen() {
 }
 
 // ---- WebRTC / signaling ---------------------------------------------------
-// Metered TURN relay. The turns:...:443 entry tunnels the whole stream inside
-// TLS on 443 so it looks like HTTPS — the path that gets through a school filter
-// (use it with the "Force relay" toggle on). Regenerate these in your Metered
-// dashboard if the quota gets abused.
-const ICE = [
-  { urls: "stun:stun.relay.metered.ca:80" },
-  { urls: "turn:global.relay.metered.ca:80", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
-  { urls: "turn:global.relay.metered.ca:80?transport=tcp", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
-  { urls: "turn:global.relay.metered.ca:443", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
-  { urls: "turns:global.relay.metered.ca:443?transport=tcp", username: "36292581ea281c3ca146486f", credential: "VOadz1IOJqzHUZRa" },
-];
+// ICE servers. STUN only by default — no TURN credentials ship with this file,
+// because anything committed here is readable by everyone the page is served to.
+// Bring your own relay when both ends are behind symmetric NAT (or when a filter
+// only lets TLS/443 through): put it in the "TURN relay" box in the panel, as
+//     turns:host:443?transport=tcp|username|password
+// or pass ?turn=<that same string> in the URL. It is stored in this browser only.
+function buildIce() {
+  const list = [{ urls: "stun:stun.l.google.com:19302" }];
+  const spec = (S.turn || "").trim();
+  if (spec) {
+    const [urls, username, credential] = spec.split("|");
+    if (urls) list.push(username ? { urls, username, credential } : { urls });
+  }
+  return list;
+}
 
 let gotFirstFrame = false, candCounts = { host: 0, srflx: 0, relay: 0 };
 
@@ -417,9 +531,17 @@ async function networkTest() {
 
   // 4. THE key test for this network: can we allocate a relay candidate through
   //    the TURNS-on-443 server? If yes, the disguised-as-HTTPS path is open.
-  dbg("4. Testing TURNS relay on 443 (this is the one that matters)…");
+  if (!(S.turn || "").trim()) {
+    dbg("4. No TURN relay configured — skipping the relay test.", "warn");
+    dbg("— VERDICT —");
+    if (!wsOk) dbg("Signaling itself is blocked — the server URL is filtered here.", "bad");
+    else if (srflx) dbg("Signaling + UDP both work — WebRTC should connect without a relay.", "ok");
+    else dbg("UDP is blocked. Use GPU or JPEG mode, or add your own TURN relay above.", "warn");
+    return;
+  }
+  dbg("4. Testing your TURN relay on 443 (this is the one that matters)…");
   const relay = await new Promise((res) => {
-    const t = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: "relay" });
+    const t = new RTCPeerConnection({ iceServers: buildIce(), iceTransportPolicy: "relay" });
     let r = false;
     t.onicecandidate = (e) => {
       if (!e.candidate) { try { t.close(); } catch {} return res(r); }
@@ -448,17 +570,27 @@ async function networkTest() {
 }
 
 // A room CODE (not a ws URL) is resolved to the host's current tunnel URL via
-// the directory server — so a changing trycloudflare URL is found by a stable code.
-const DIRECTORY_URL = BAKED_URL;
+// the directory server — so a changing trycloudflare URL is found by a stable
+// code. The code is never sent as-is: what goes out is sha256(code + access
+// key), so the directory can only be queried by someone who already has the key.
+function directoryUrl() {
+  return (S.directory || "").trim() || (location.host ? sameOrigin : BAKED_URL);
+}
 function resolveServer(input) {
   input = (input || "").trim();
   if (/^wss?:\/\//i.test(input)) return Promise.resolve(input);
-  dbg("Looking up host by code “" + input + "”…");
+  const dirUrl = directoryUrl();
+  if (!dirUrl) {
+    dbg("No directory server set — enter one, or paste the host's wss:// URL.", "bad");
+    return Promise.resolve(null);
+  }
+  dbg("Looking up host by code (sent hashed, never in the clear)…");
+  const entry = dirKey(input, S.key);
   return new Promise((res) => {
     let done = false;
-    const d = new WebSocket(DIRECTORY_URL);
+    const d = new WebSocket(dirUrl);
     const finish = (u) => { if (!done) { done = true; try { d.close(); } catch {} res(u); } };
-    d.onopen = () => d.send(JSON.stringify({ type: "lookup", code: input }));
+    d.onopen = () => d.send(JSON.stringify({ type: "lookup", code: entry }));
     d.onmessage = (e) => { try { const m = JSON.parse(e.data); if (m.type === "url") finish(S.lan && m.lan ? m.lan : m.url); } catch {} };
     d.onerror = () => finish(null);
     setTimeout(() => finish(null), 9000);
@@ -466,7 +598,14 @@ function resolveServer(input) {
 }
 
 async function connect() {
+  if (!S.key) {
+    dbg("No access key. Ask the host owner for it and put it in the panel.", "bad");
+    setStatus("access key required");
+    openSettings();
+    return;
+  }
   wantConnected = true;
+  authed = false;
   curFps = S.fps; curScale = S.scale; mediaPing = null;
   lagHist = []; baseLag = curLag = null;
   if (S.audio && isWs()) setupAudio();   // create AudioContext in the click gesture
@@ -476,7 +615,9 @@ async function connect() {
   setStatus("connecting…");
   const input = (S.server || "").trim();
   const isCode = !/^wss?:\/\//i.test(input);
-  effRoom = isCode ? input.toLowerCase() : "default";   // the code IS the room
+  // The code IS the room. When a wss:// URL is pasted instead, the room comes
+  // from ?room= (default "default") and must match the host's ROOM.
+  effRoom = isCode ? input.toLowerCase() : (S.room || "default").toLowerCase();
   const wsUrl = await resolveServer(S.server);
   if (!wantConnected) return;
   if (!wsUrl) {
@@ -490,10 +631,11 @@ async function connect() {
   ws.binaryType = "arraybuffer";
   ws.onopen = () => {
     dbg("WebSocket OPEN ✓ — signaling reachable", "ok");
-    wsSend({ type: "register", role: "viewer", room: effRoom });
-    dbg("Registered as viewer (room: " + effRoom + ")");
-    setStatus("waiting for host… (free server can take ~50s to wake)");
-    if (isWs()) requestStream();
+    // Register under the hashed room id, so the signaling server never sees the
+    // room code and nobody can squat the room to harvest keystrokes.
+    wsSend({ type: "register", role: "viewer", room: wireRoom(effRoom, S.key) });
+    dbg("Registered as viewer — waiting for the host's access-key challenge");
+    setStatus("waiting for host…");
     // Heartbeat: a little traffic every 15s so idle-timeout middleboxes (and
     // some school filters) don't silently close the signaling socket.
     clearInterval(ws._ka);
@@ -515,13 +657,33 @@ async function connect() {
       return;
     }
     const m = JSON.parse(ev.data);
-    if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
+    if (m.type === "auth-challenge") {
+      // Answer with HMAC(key, nonce): proof of the key without sending it.
+      dbg("Host asked for the access key — answering the challenge");
+      wsSend({ type: "auth-response", proof: authProof(effRoom, S.key, m.nonce) });
+    }
+    else if (m.type === "auth-ok") {
+      authed = true;
+      dbg("Access key accepted ✓", "ok");
+      setStatus("connecting…");
+      if (isWs()) requestStream();
+    }
+    else if (m.type === "auth-failed") {
+      authed = false;
+      dbg("Access key REJECTED by the host — check it and reconnect.", "bad");
+      setStatus("wrong access key");
+      wantConnected = false;               // don't hammer the host with retries
+      clearTimeout(reconnectTimer); reconnectTimer = null;
+      openSettings();
+      try { ws.close(); } catch {}
+    }
+    else if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
     else if (m.type === "codec-info") { setupDecoder(m.codec); }
     else if (m.type === "offer") {
       if (isWs()) return;   // ignore WebRTC in WebSocket modes
       dbg("Offer received from host ✓", "ok"); await handleOffer(m);
     }
-    else if (m.type === "host-ready") { dbg("Host is ready"); if (isWs()) requestStream(); }
+    else if (m.type === "host-ready") { dbg("Host is ready — waiting for its challenge"); }
     else if (m.type === "peer-left") {
       dbg("Host signaling dropped", "warn");
       // If media is still flowing, keep it (WebRTC is independent of signaling).
@@ -529,7 +691,7 @@ async function connect() {
       if (!connected) scheduleReconnect();
     }
   };
-  ws.onclose = () => { clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
+  ws.onclose = () => { authed = false; clearInterval(ws._ka); clearInterval(ws._ping); dbg("WebSocket CLOSED (media keeps running if already connected)", "warn"); setStatus("signaling closed"); };
   ws.onerror = () => { dbg("WebSocket ERROR ✗ — blocked, offline, or wrong URL", "bad"); setStatus("signaling error — is the server URL right / blocked?"); };
 }
 
@@ -716,7 +878,7 @@ async function handleOffer(m) {
   setStatus("negotiating…");
   const policy = S.relay ? "relay" : "all";
   if (S.relay) dbg("Force-relay ON — media will go only through TURN(S).", "warn");
-  pc = new RTCPeerConnection({ iceServers: ICE, iceTransportPolicy: policy });
+  pc = new RTCPeerConnection({ iceServers: buildIce(), iceTransportPolicy: policy });
 
   pc.ontrack = (e) => {
     dbg("Video track received ✓ (waiting for frames…)", "ok");

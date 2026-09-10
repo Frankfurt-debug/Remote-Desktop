@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 .env
 server.pid
+
+# Local secrets. config.bat holds the ACCESS_KEY and any relay credentials —
+# it must never be committed. Share it (or just the key) out of band instead.
+host-agent/config.bat
+config.bat
+*.local

@@ -1,7 +1,10 @@
 @echo off
 REM ===  Restart the self-hosted Remote Desktop (after a code update)  ===
 REM Double-click this: it kills the host, signaling server and tunnel, then
-REM relaunches start-selfhosted.bat. Your client auto-reconnects by room code.
+REM relaunches start-selfhosted.bat. NOTE: the taskkill lines below kill EVERY
+REM python.exe and node.exe on this PC, not just this project's — close other
+REM Python/Node work first.
+REM Your client auto-reconnects by room code.
 
 echo Stopping host, signaling server and tunnel...
 taskkill /F /IM cloudflared.exe >nul 2>&1
