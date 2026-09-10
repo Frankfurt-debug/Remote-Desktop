@@ -1093,22 +1093,34 @@ async def publish_tunnel():
         [CLOUDFLARED, "tunnel", "--url", f"http://localhost:{LOCAL_PORT}"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
-    url = None
-    while url is None:
+    https_url = None
+    while https_url is None:
         line = await loop.run_in_executor(None, proc.stdout.readline)
         if not line:
             print("cloudflared exited before giving a URL"); return
         m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
         if m:
-            url = m.group(0).replace("https://", "wss://")
+            https_url = m.group(0)
+    url = https_url.replace("https://", "wss://")
 
+    # The signaling server also serves the viewer page, so the tunnel gives a
+    # link that opens the viewer already pointed at this host. ?room= carries
+    # the room code, which the viewer needs to derive the same hashed room id.
+    # The access key is deliberately NOT in the link — send it separately.
+    link = f"{https_url}/?room={ROOM}"
     lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
-    print("\n" + "=" * 56)
-    print(f"  TUNNEL READY.  Viewers connect with ROOM CODE:  {ROOM}")
-    print(f"  (they type '{ROOM}' in the Signaling box)")
-    print(f"  internet URL: {url}")
-    print(f"  same-WiFi:    {lan}  (LAN toggle)")
-    print("=" * 56 + "\n")
+    print("\n" + "=" * 68)
+    print("  TUNNEL READY. Send this link to the person connecting:")
+    print()
+    print(f"    {link}")
+    print()
+    print("  Then send them the ACCESS KEY separately (a different message,")
+    print("  not alongside this link). They open the link, type the key, Connect.")
+    print()
+    print(f"  room code:    {ROOM}")
+    print(f"  signaling:    {url}")
+    print(f"  same-WiFi:    {lan}  (tick 'Same WiFi as host')")
+    print("=" * 68 + "\n")
 
     async def drain():                       # keep cloudflared's pipe from filling
         while True:

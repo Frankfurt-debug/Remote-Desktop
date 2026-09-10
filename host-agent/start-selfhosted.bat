@@ -18,9 +18,11 @@ timeout /t 2 >nul
 
 echo.
 echo ============================================================
-echo   Your ROOM CODE is:   %ROOM%
-echo   The viewer types that in the "Host code" box, plus the
-echo   access key you agreed on. Send the key separately.
+echo   Room code: %ROOM%
+echo.
+echo   In a moment this window prints a link to send to the
+echo   person connecting. Send them the ACCESS KEY in a
+echo   separate message, not next to the link.
 echo ============================================================
 echo.
 %PY% "%~dp0host.py"
