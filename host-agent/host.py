@@ -984,46 +984,124 @@ def lan_ip():
         s.close()
 
 
-async def publish_tunnel():
-    """Spawn cloudflared, extract the trycloudflare URL, and keep publishing it to
-    the directory server under ROOM so viewers can find it by code."""
+TUNNEL_METRICS_PORT = int(os.environ.get("TUNNEL_METRICS_PORT", "20480"))
+_tunnel = {"url": None, "lan": None}       # what the directory should point at
+_tunnel_changed = asyncio.Event()
+
+
+def _tunnel_ready_connections():
+    """How many live connections cloudflared has to Cloudflare's edge.
+    0 means the tunnel is dead (e.g. after a network change), None = unknown."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{TUNNEL_METRICS_PORT}/ready", timeout=4) as r:
+            return int(json.loads(r.read()).get("readyConnections", 0))
+    except Exception as e:
+        body = getattr(e, "read", None)
+        if body:                                  # /ready answers 503 + JSON when unhealthy
+            try:
+                return int(json.loads(body()).get("readyConnections", 0))
+            except Exception:
+                pass
+        return None
+
+
+async def tunnel_supervisor():
+    """Keep a working Cloudflare quick tunnel up. A quick tunnel dies for good when
+    the network drops (Cloudflare deletes its hostname), so when cloudflared loses
+    all its connections for too long we throw it away and start a fresh one — the
+    publisher then pushes the new URL to the directory, and viewers using the room
+    code reconnect to it automatically."""
     import re
     import subprocess
     loop = asyncio.get_event_loop()
-    print("starting Cloudflare tunnel ...")
-    proc = subprocess.Popen(
-        [CLOUDFLARED, "tunnel", "--url", f"http://localhost:{LOCAL_PORT}"],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-    )
-    url = None
-    while url is None:
-        line = await loop.run_in_executor(None, proc.stdout.readline)
-        if not line:
-            print("cloudflared exited before giving a URL"); return
-        m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
-        if m:
-            url = m.group(0).replace("https://", "wss://")
+    first = True
+    while True:
+        print("starting Cloudflare tunnel ..." if first else "starting a NEW Cloudflare tunnel ...")
+        proc = subprocess.Popen(
+            [CLOUDFLARED, "tunnel", "--metrics", f"127.0.0.1:{TUNNEL_METRICS_PORT}",
+             "--url", f"http://localhost:{LOCAL_PORT}"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
 
-    lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
-    print("\n" + "=" * 56)
-    print(f"  TUNNEL READY.  Viewers connect with ROOM CODE:  {ROOM}")
-    print(f"  (they type '{ROOM}' in the Signaling box)")
-    print(f"  internet URL: {url}")
-    print(f"  same-WiFi:    {lan}  (LAN toggle)")
-    print("=" * 56 + "\n")
+        async def read_url():
+            while True:
+                line = await loop.run_in_executor(None, proc.stdout.readline)
+                if not line:
+                    return None
+                m = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    return m.group(0).replace("https://", "wss://")
 
-    async def drain():                       # keep cloudflared's pipe from filling
+        try:
+            url = await asyncio.wait_for(read_url(), timeout=90)
+        except asyncio.TimeoutError:
+            url = None
+        if not url:
+            print("cloudflared did not produce a URL (offline?); retrying in 10s")
+            proc.kill()
+            await asyncio.sleep(10)
+            continue
+
+        async def drain():                   # keep cloudflared's pipe from filling
+            while await loop.run_in_executor(None, proc.stdout.readline):
+                pass
+        asyncio.create_task(drain())
+
+        lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
+        _tunnel.update(url=url, lan=lan)
+        _tunnel_changed.set()
+        print()
+        print("=" * 56)
+        print(f"  TUNNEL READY.  Viewers connect with ROOM CODE:  {ROOM}")
+        print(f"  (they type '{ROOM}' in the Signaling box)")
+        print(f"  internet URL: {url}")
+        print(f"  same-WiFi:    {lan}  (LAN toggle)")
+        print("=" * 56)
+        print()
+        first = False
+
+        # Health watch: give it time to connect, then require live edge connections.
+        await asyncio.sleep(20)
+        dead_for = 0
         while True:
-            if not await loop.run_in_executor(None, proc.stdout.readline):
+            await asyncio.sleep(10)
+            if proc.poll() is not None:
+                print("cloudflared exited - replacing the tunnel")
                 break
-    asyncio.create_task(drain())
+            n = await loop.run_in_executor(None, _tunnel_ready_connections)
+            dead_for = dead_for + 10 if n == 0 else 0
+            if dead_for >= 40:
+                print("tunnel lost its connection to Cloudflare (network change?) - replacing it")
+                break
+            new_lan = f"ws://{lan_ip()}:{LOCAL_PORT}"
+            if new_lan != _tunnel["lan"]:            # network changed but tunnel survived
+                _tunnel["lan"] = new_lan
+                _tunnel_changed.set()
+        try:
+            proc.kill()
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        _tunnel.update(url=None)
+        await asyncio.sleep(2)
 
-    while True:                              # publish + refresh in the directory
+
+async def directory_publisher():
+    """Publish the current tunnel URL under ROOM, immediately when it changes and
+    every 20s otherwise, so the directory never points at a dead tunnel for long."""
+    while True:
         try:
             async with websockets.connect(DIRECTORY_URL, open_timeout=60) as dws:
                 while True:
-                    await dws.send(json.dumps({"type": "publish-url", "code": ROOM, "url": url, "lan": lan}))
-                    await asyncio.sleep(30)
+                    if _tunnel["url"]:
+                        await dws.send(json.dumps({"type": "publish-url", "code": ROOM,
+                                                   "url": _tunnel["url"], "lan": _tunnel["lan"]}))
+                    _tunnel_changed.clear()
+                    try:
+                        await asyncio.wait_for(_tunnel_changed.wait(), timeout=20)
+                    except asyncio.TimeoutError:
+                        pass
         except Exception as e:
             print(f"directory publish failed ({e}); retrying in 5s")
             await asyncio.sleep(5)
@@ -1032,7 +1110,7 @@ async def publish_tunnel():
 async def amain():
     tasks = [run()]
     if TUNNEL:
-        tasks.append(publish_tunnel())
+        tasks += [tunnel_supervisor(), directory_publisher()]
     await asyncio.gather(*tasks)
 
 
