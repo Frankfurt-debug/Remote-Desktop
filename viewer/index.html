@@ -537,7 +537,8 @@ async function connect() {
 function requestStream() {
   const codec = S.mode === "gpu" ? "h264" : "jpeg";
   dbg("Requesting " + (codec === "h264" ? "GPU H.264" : "JPEG") + " stream…");
-  wsSend({ type: "start-stream", codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput, cursorhide: S.cursorhide });
+  h264Rx = 0;
+  wsSend({ type: "start-stream", ack: true, codec, fps: curFps, scale: curScale, quality: S.quality, cursor: S.cursor, gameinput: S.gameinput, cursorhide: S.cursorhide });
   if (S.audio) { setupAudio(); wsSend({ type: "enable-audio" }); }
   if (S.mic) startMic();
 }
@@ -557,7 +558,9 @@ function setupDecoder(codecStr) {
     dbg("H.264 decoder ready (" + codecStr + ")", "ok");
   } catch (e) { dbg("decoder setup failed: " + e.message, "bad"); }
 }
+let h264Rx = 0;
 function decodeH264(buf) {
+  wsSend({ type: "ack", n: ++h264Rx });   // flow control: tell host we got it
   if (!decoder || decoder.state !== "configured") return;
   const arr = new Uint8Array(buf);
   const key = arr[0] === 1;

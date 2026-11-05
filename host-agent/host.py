@@ -532,6 +532,10 @@ def h264_codec_string(annexb: bytes) -> str:
     return "avc1.42E01F"
 
 
+# Max unacknowledged video frames in flight (~100ms at 60fps).
+ACK_WINDOW = int(os.environ.get("ACK_WINDOW", "6"))
+
+
 def make_nvenc(w: int, h: int, fps: int, bitrate: int):
     """Create a low-latency H.264 NVENC encoder for the given size/fps/bitrate."""
     enc = av.codec.CodecContext.create("h264_nvenc", "w")
@@ -669,7 +673,20 @@ async def connect_once():
             need_codec_info = False
             pts = 0
             frames = 0
+            stream_state["acked"] = 0
+            wait_since = None
             while stream_state["run"]:
+                # Flow control: if the viewer acks frames, keep at most ACK_WINDOW
+                # unacknowledged frames in flight. Instead of piling frames into
+                # network buffers (latency creeping up), we simply don't encode the
+                # next one until the pipe drains - latency stays bounded and fps
+                # adapts to the real bandwidth. (Skipping capture keeps H.264 intact.)
+                if stream_state.get("ack") and frames - stream_state["acked"] >= ACK_WINDOW:
+                    wait_since = wait_since or time.time()
+                    if time.time() - wait_since < 1.0:
+                        await asyncio.sleep(0.003)
+                        continue
+                wait_since = None
                 t0 = time.time()
                 try:
                     arr, ml, mt = await loop.run_in_executor(None, _grab, MONITOR)
@@ -865,7 +882,7 @@ async def connect_once():
                 if pc:
                     await pc.close()
                     pc = None
-                for k in ("fps", "scale", "quality", "cursor", "codec"):
+                for k in ("fps", "scale", "quality", "cursor", "codec", "ack"):
                     if k in msg:
                         stream_state[k] = msg[k]
                 if "gameinput" in msg:
@@ -907,6 +924,9 @@ async def connect_once():
             elif mtype == "ping":
                 # Latency probe: echo the viewer's timestamp straight back.
                 await ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
+
+            elif mtype == "ack":
+                stream_state["acked"] = int(msg.get("n", 0))
 
             elif mtype == "request-keyframe":
                 stream_state["force_key"] = True    # decoder needs to resync
