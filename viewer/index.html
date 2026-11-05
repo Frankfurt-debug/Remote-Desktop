@@ -82,6 +82,7 @@
     <button class="ui" id="btnFull">⛶ Fullscreen</button>
     <button class="ui" id="btnLock">🖱 Capture mouse</button>
     <button class="ui" id="btnLog">📋 Log</button>
+    <button class="ui" id="btnSpeed">📶 Speed test</button>
     <button class="ui" id="btnLeave">⏏ Leave</button>
   </div>
 
@@ -144,6 +145,7 @@
       <div class="grp">
         <h2>Overlay</h2>
         <div class="field"><label for="hudOn">Show stats (top-right)</label><input type="checkbox" id="hudOn"></div>
+        <div id="hudItems" style="margin:-4px 0 6px 14px;padding-left:10px;border-left:2px solid var(--line)"></div>
         <div class="field"><label for="toolbarOn">Show toolbar buttons (top-left)</label><input type="checkbox" id="toolbarOn"></div>
         <div class="field"><label for="logOn">Show connection log (bottom-left)</label><input type="checkbox" id="logOn"></div>
         <div style="font-size:11px;color:var(--dim);margin-top:4px">Tip: with the toolbar hidden, press <b>Esc</b> to reopen this menu.</div>
@@ -191,13 +193,32 @@ const DEFAULTS = {
   server: location.host ? sameOrigin : "", room: "default",
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
-  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false,
+  mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false, hudItems: {},
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
 if (qs.get("server")) S.server = qs.get("server");
 if (qs.get("room")) S.room = qs.get("room");
 if (qs.get("sens")) S.sens = parseFloat(qs.get("sens"));
+// Every line the stats overlay can show: [key, overlay label, settings label].
+// Each one can be switched on/off under Settings -> Overlay.
+const HUD_ITEMS = [
+  ["mode",    "Mode",       "Mode"],
+  ["fps",     "FPS",        "Frame rate"],
+  ["ping",    "Ping",       "Ping"],
+  ["res",     "Res",        "Resolution"],
+  ["rate",    "Data",       "Data rate coming in (Mbps)"],
+  ["route",   "Route",      "Route (WebRTC: relay or direct)"],
+  ["lag",     "Input lag",  "Input lag"],
+  ["buildup", "Buildup",    "Buildup (lag piling up)"],
+  ["audio",   "Audio",      "Audio delay"],
+  ["pathmax", "PC→you max", "Max speed between PC and you"],
+  ["hostup",  "PC upload",  "PC's upload speed"],
+  ["mydown",  "Your down",  "Your download speed"],
+];
+const hudOn = (k) => (S.hudItems || {})[k] !== false;   // everything on by default
+$("hudItems").innerHTML = HUD_ITEMS.map(([k, , long]) =>
+  `<div class="field" style="margin:5px 0"><label for="hud_${k}" style="font-size:12px">${long}</label><input type="checkbox" id="hud_${k}"></div>`).join("");
 function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S)); }
 
 // Bind form <-> S
@@ -209,6 +230,7 @@ function formToS() {
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
   S.lan = $("lanOn").checked; S.cursorhide = $("cursorhide").checked;
+  S.hudItems = {}; for (const [k] of HUD_ITEMS) S.hudItems[k] = $("hud_" + k).checked;
 }
 function sToForm() {
   $("server").value = S.server;
@@ -219,6 +241,7 @@ function sToForm() {
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
   $("lanOn").checked = S.lan; $("cursorhide").checked = S.cursorhide;
+  for (const [k] of HUD_ITEMS) $("hud_" + k).checked = hudOn(k);
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -346,6 +369,65 @@ $("btnFull").onclick = toggleFullscreen;
 $("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
 $("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
 $("btnLeave").onclick = leave;
+$("btnSpeed").onclick = runSpeedTest;
+
+// ---- Speed test -----------------------------------------------------------
+// 1) PC -> you: the host streams junk down the real connection for ~4s, paced
+//    by our acks, and we time it: the true max between the two machines.
+// 2) PC upload: the host uploads to Cloudflare's speed-test server.
+// 3) Your download: we download from Cloudflare's speed-test server.
+// Blank until you press the button. The stream may stutter while it runs.
+const speed = { path: null, hostUp: null, myDown: null, pathRunning: false, hostUpRunning: false, myDownRunning: false };
+let stBytes = 0, stFirst = 0, stLast = 0, stFirstLen = 0;
+function runSpeedTest() {
+  if (!ws || ws.readyState !== 1 || speed.pathRunning) return;
+  Object.assign(speed, { path: null, hostUp: null, myDown: null, pathRunning: true, hostUpRunning: true, myDownRunning: false });
+  stBytes = 0; stFirst = 0; stLast = 0;
+  dbg("Speed test: measuring PC → you …");
+  wsSend({ type: "speedtest" });
+  pollStats();
+}
+function onSpeedChunk(len) {
+  const now = performance.now();
+  if (!stFirst) { stFirst = now; stFirstLen = len; }
+  stLast = now; stBytes += len;
+  wsSend({ type: "st-ack", n: stBytes });
+}
+async function finishPathTest() {
+  const secs = (stLast - stFirst) / 1000;
+  speed.path = secs > 0.05 ? (stBytes - stFirstLen) * 8 / secs / 1e6 : false;
+  speed.pathRunning = false;
+  dbg("Speed test: PC → you max = " + fmtMbps(speed.path) + "; measuring your download …", "ok");
+  speed.myDownRunning = true; pollStats();
+  speed.myDown = await myDownloadMbps();
+  speed.myDownRunning = false;
+  dbg("Speed test: your download = " + fmtMbps(speed.myDown), "ok");
+  pollStats();
+}
+async function myDownloadMbps() {
+  // Time-boxed: read for up to 5s however fast the line is, then stop.
+  const ctl = new AbortController();
+  let bytes = 0, first = 0, firstLen = 0, last = 0;
+  try {
+    const r = await fetch("https://speed.cloudflare.com/__down?bytes=200000000", { signal: ctl.signal, cache: "no-store" });
+    const rd = r.body.getReader();
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      const now = performance.now();
+      if (!first) { first = now; firstLen = value.length; }
+      last = now; bytes += value.length;
+      if (now - first > 5000) { ctl.abort(); break; }
+    }
+  } catch {}
+  const secs = (last - first) / 1000;
+  return secs > 0.05 ? (bytes - firstLen) * 8 / secs / 1e6 : false;   // false = blocked
+}
+function fmtMbps(v) {
+  if (v === false) return "blocked";
+  if (v == null) return "–";
+  return (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " Mbps";
+}
 
 // Explicit leave: tell the host so it cleanly drops the connection (otherwise
 // the host keeps the stream alive to survive flaky signaling, which would block
@@ -509,13 +591,17 @@ async function connect() {
     // 2 = Opus audio, 3 = JPEG frame.
     if (ev.data instanceof ArrayBuffer) {
       const a = new Uint8Array(ev.data);
+      rxBytes += a.length;                      // for the live data-rate readout
+      if (a[0] === 5) { onSpeedChunk(a.length); return; }   // speed-test data
       if (a[0] === 2) decodeAudio(a.subarray(1));
       else if (a[0] === 3) renderFrame(a.subarray(1));
       else decodeH264(ev.data);
       return;
     }
     const m = JSON.parse(ev.data);
-    if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
+    if (m.type === "speedtest-done") { finishPathTest(); }
+    else if (m.type === "host-up") { speed.hostUp = m.mbps == null ? false : m.mbps; speed.hostUpRunning = false; pollStats(); }
+    else if (m.type === "pong") { wsPing = Math.round(performance.now() - m.t); if (isWs()) recordLag(wsPing); }
     else if (m.type === "codec-info") { setupDecoder(m.codec); }
     else if (m.type === "offer") {
       if (isWs()) return;   // ignore WebRTC in WebSocket modes
@@ -685,11 +771,33 @@ function recordLag(p) {
   if (lagHist.length > 40) lagHist.shift();
   baseLag = Math.min.apply(null, lagHist);
 }
-function lagLines() {
-  if (curLag == null) return "";
+function lagStats(st) {
+  if (curLag == null) return;
   const b = baseLag != null ? Math.max(0, curLag - baseLag) : 0;
   const col = b > 80 ? "#ff6b6b" : b > 30 ? "#ffd479" : "#8f8";
-  return `<br>Input lag <b>${curLag} ms</b><br>Buildup <b style="color:${col}">+${b} ms</b>`;
+  st.lag = curLag + " ms";
+  st.buildup = `<span style="color:${col}">+${b} ms</span>`;
+}
+// Draw the overlay from a {key: value} object, showing only the enabled lines.
+function renderHud(st) {
+  if (!S.hud) return;
+  const show = (running, v) => running ? "testing…" : (v === null ? null : fmtMbps(v));
+  st.pathmax = show(speed.pathRunning, speed.path);
+  st.hostup  = show(speed.hostUpRunning, speed.hostUp);
+  st.mydown  = show(speed.myDownRunning, speed.myDown);
+  const rows = [];
+  for (const [k, label] of HUD_ITEMS) if (hudOn(k) && st[k] != null) rows.push(`${label} <b>${st[k]}</b>`);
+  if (locked()) rows.push(`<span class="lock">● mouse captured</span>`);
+  hud.innerHTML = rows.join("<br>") || `<span style="color:#888">(all stats hidden)</span>`;
+}
+// Live data rate: every binary byte from the host, per second.
+let rxBytes = 0, rxLastBytes = 0, rxLastT = 0;
+function rxRateMbps() {
+  const now = performance.now();
+  let v = null;
+  if (rxLastT) v = (rxBytes - rxLastBytes) * 8 / ((now - rxLastT) / 1000) / 1e6;
+  rxLastBytes = rxBytes; rxLastT = now;
+  return v;
 }
 async function renderFrame(buf) {
   try {
@@ -895,9 +1003,17 @@ async function pollStats() {
   if (isWs()) {                        // WebSocket modes have no pc — show frame stats
     mediaPing = wsPing;
     adaptQuality();
-    if (S.hud) hud.innerHTML = `Mode <b>${S.mode === "gpu" ? "GPU H.264" : "JPEG"}</b><br>Ping <b>${wsPing == null ? "–" : wsPing + " ms"}</b><br>FPS <b>${fpsShown}</b> / ${curFps}<br>Res <b>${canvas.width}×${canvas.height}</b>` + lagLines() +
-      (S.audio ? `<br>Audio <b>${audioDelayMs} ms</b>` : "") +
-      (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
+    const r = rxRateMbps();
+    const st = {
+      mode: S.mode === "gpu" ? "GPU H.264" : "JPEG",
+      ping: wsPing == null ? "–" : wsPing + " ms",
+      fps: `${fpsShown} / ${curFps}`,
+      res: `${canvas.width}×${canvas.height}`,
+      rate: r == null ? "–" : fmtMbps(r),
+      audio: S.audio ? audioDelayMs + " ms" : null,
+    };
+    lagStats(st);
+    renderHud(st);
     return;
   }
   if (!pc) return;
@@ -950,13 +1066,9 @@ async function pollStats() {
     if (rtt != null) { mediaPing = Math.round(rtt * 1000); recordLag(mediaPing); }
     adaptQuality();
     const ping = rtt != null ? Math.round(rtt * 1000) + " ms" : "–";
-    if (S.hud) {
-      hud.innerHTML =
-        `FPS <b>${fps}</b><br>Ping <b>${ping}</b><br>` +
-        `Res <b>${w}×${h}</b><br>Rate <b>${(kbps/1000).toFixed(1)} Mbps</b><br>` +
-        `Route <b>${route}</b>` + lagLines() +
-        (locked() ? `<br><span class="lock">● mouse captured</span>` : "");
-    }
+    const st = { mode: "WebRTC", fps, ping, res: `${w}×${h}`, rate: fmtMbps(kbps / 1000), route };
+    lagStats(st);
+    renderHud(st);
   } catch {}
 }
 setInterval(pollStats, 1000);

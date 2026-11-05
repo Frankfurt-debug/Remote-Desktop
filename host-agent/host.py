@@ -532,6 +532,32 @@ def h264_codec_string(annexb: bytes) -> str:
     return "avc1.42E01F"
 
 
+def host_upload_mbps():
+    """Measure this PC's internet upload speed against Cloudflare's speed-test
+    server. Uploads progressively bigger chunks (time-boxed to ~6s) and reports
+    the rate of the largest one, so slow and fast connections both finish quickly."""
+    import urllib.request
+    best, size, start = None, 500_000, time.time()
+    while time.time() - start < 6 and size <= 32_000_000:
+        data = os.urandom(size)
+        req = urllib.request.Request("https://speed.cloudflare.com/__up", data=data, method="POST",
+                                     # Cloudflare 403s Python's default "Python-urllib" agent.
+                                     headers={"Content-Type": "application/octet-stream",
+                                              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) remote-desktop-speedtest"})
+        t = time.time()
+        try:
+            urllib.request.urlopen(req, timeout=15).read()
+        except Exception as e:
+            print("upload test failed:", e)
+            break
+        dt = time.time() - t
+        best = size * 8 / dt / 1e6
+        if dt > 1.5:
+            break
+        size *= 4
+    return best
+
+
 # Max unacknowledged video frames in flight (~100ms at 60fps).
 ACK_WINDOW = int(os.environ.get("ACK_WINDOW", "6"))
 
@@ -737,6 +763,36 @@ async def connect_once():
                     await asyncio.sleep(interval - dt)
             print(f"NVENC H.264 stream: stopped ({frames} packets)")
 
+        # Speed test: send junk (tagged 0x05) down the same path the video uses for
+        # ~4s. The viewer acks bytes as they arrive and we keep at most 2 MB
+        # unacknowledged, so this measures the real path speed instead of just
+        # filling buffers. Then measure this PC's upload to Cloudflare separately.
+        st_state = {"acked": 0, "running": False}
+
+        async def speedtest():
+            if st_state["running"]:
+                return
+            st_state.update(acked=0, running=True)
+            loop = asyncio.get_event_loop()
+            try:
+                chunk = bytes([5]) + os.urandom(65536)   # 0x05 = speed-test data
+                sent, t0 = 0, time.time()
+                while time.time() - t0 < 4.0:
+                    if sent - st_state["acked"] < 2_000_000:
+                        await ws.send(chunk)
+                        sent += 65536
+                    else:
+                        await asyncio.sleep(0.002)
+                await ws.send(json.dumps({"type": "speedtest-done", "sent": sent}))
+                print(f"speed test: sent {sent // 1_000_000} MB down the path; measuring upload ...")
+                up = await loop.run_in_executor(None, host_upload_mbps)
+                print(f"speed test: PC upload = {up and round(up, 1)} Mbps")
+                await ws.send(json.dumps({"type": "host-up", "mbps": up}))
+            except Exception as e:
+                print("speed test error:", e)
+            finally:
+                st_state["running"] = False
+
         async def ws_stream():
             loop = asyncio.get_event_loop()
             last = None
@@ -924,6 +980,12 @@ async def connect_once():
             elif mtype == "ping":
                 # Latency probe: echo the viewer's timestamp straight back.
                 await ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
+
+            elif mtype == "speedtest":
+                asyncio.create_task(speedtest())
+
+            elif mtype == "st-ack":
+                st_state["acked"] = int(msg.get("n", 0))
 
             elif mtype == "ack":
                 stream_state["acked"] = int(msg.get("n", 0))
