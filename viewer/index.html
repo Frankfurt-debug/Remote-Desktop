@@ -5,28 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Remote Desktop</title>
 <style>
-  :root { --accent:#2d7dff; --bg:#0c0c0e; --panel:#16161a; --line:#2a2a32; --txt:#e8e8ea; --dim:#9a9aa4; }
+  :root { --accent:#3b82f6; --accent2:#60a5fa; --bg:#0b0b0f; --panel:#15151b; --card:#1b1b23;
+          --line:#2a2a35; --txt:#ececf1; --dim:#9696a3; }
   html, body { margin:0; height:100%; background:#000; overflow:hidden; font-family:system-ui, sans-serif; color:var(--txt); }
   #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
   video, canvas { max-width:100%; max-height:100%; display:block; background:#000; }
   video.fill, canvas.fill { width:100%; height:100%; object-fit:fill; }
   video.contain, canvas.contain { width:100%; height:100%; object-fit:contain; }
 
-  /* While streaming, hide the local cursor so only the host-drawn one shows
-     (fixes seeing two cursors / the mouse over a fullscreen game). Buttons
-     re-enable a pointer so the toolbar stays usable. */
+  /* While streaming, hide the local cursor so only the host-drawn one shows. */
   body.nocursor, body.nocursor video, body.nocursor canvas, body.nocursor #stage { cursor:none; }
   body.nocursor .ui { cursor:pointer; }
 
-  /* Toolbar (top-left) */
-  #toolbar { position:fixed; top:10px; left:10px; z-index:6; display:none; gap:6px; }
+  /* Toolbar, stats and log are positioned from JS (see applyLayout) so they can
+     be moved anywhere; the values here are just the defaults. */
+  #toolbar { position:fixed; top:10px; left:10px; z-index:6; display:none; gap:6px; flex-wrap:wrap;
+             max-width:calc(100vw - 20px); }
   body.streaming #toolbar { display:flex; }
   body.hidetoolbar #toolbar { display:none; }
   .ui { background:rgba(20,20,26,.72); color:var(--txt); border:1px solid var(--line);
         border-radius:8px; padding:7px 11px; font-size:13px; cursor:pointer; backdrop-filter:blur(4px); }
   .ui:hover { background:rgba(40,40,52,.9); }
 
-  /* Stats HUD (top-right) */
   #hud { position:fixed; top:10px; right:10px; z-index:6; display:none;
          background:rgba(10,10,14,.66); border:1px solid var(--line); border-radius:8px;
          padding:8px 10px; font:12px/1.5 ui-monospace, Menlo, Consolas, monospace; color:#bfe;
@@ -34,41 +34,96 @@
   #hud b { color:#fff; }
   #hud .lock { color:#ffd479; }
 
-  /* Settings / connect overlay */
-  #overlay { position:fixed; inset:0; z-index:10; display:flex; align-items:flex-start; justify-content:center;
-             background:rgba(0,0,0,.82); backdrop-filter:blur(3px); overflow-y:auto; padding:16px 0; box-sizing:border-box; }
-  #overlay.hidden { display:none; }
-  /* max-height + internal scroll so every field stays reachable on short screens
-     (Chromebooks) without zooming out. */
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px 22px;
-           width:380px; max-width:92vw; box-shadow:0 16px 50px rgba(0,0,0,.5);
-           max-height:calc(100vh - 32px); overflow-y:auto; margin:auto; }
-  .panel h1 { font-size:19px; margin:0 0 4px; }
-  .panel .sub { color:var(--dim); font-size:13px; margin:0 0 16px; }
-  .grp { border-top:1px solid var(--line); padding:13px 0 4px; }
-  .grp h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:0 0 10px; }
-  .field { display:flex; align-items:center; justify-content:space-between; gap:10px; margin:9px 0; }
-  .field label { font-size:13px; color:#d6d6da; }
-  .field .val { font-size:12px; color:var(--dim); min-width:42px; text-align:right; }
-  input[type=text] { width:100%; box-sizing:border-box; padding:9px 10px; border-radius:8px;
-                     border:1px solid var(--line); background:#0e0e12; color:var(--txt); font-size:13px; }
-  input[type=range] { width:150px; accent-color:var(--accent); }
-  select { background:#0e0e12; color:var(--txt); border:1px solid var(--line); border-radius:7px; padding:6px 8px; font-size:13px; }
-  input[type=checkbox] { width:17px; height:17px; accent-color:var(--accent); }
-  .full { display:block; margin:4px 0 2px; }
-  .btn { width:100%; margin-top:18px; padding:12px; border:0; border-radius:9px; background:var(--accent);
-         color:#fff; font-size:15px; font-weight:600; cursor:pointer; }
-  .btn:hover { filter:brightness(1.08); }
-  .btn.sec { background:#2a2a32; margin-top:8px; }
   #status { position:fixed; bottom:8px; left:10px; color:#6f6; font-size:12px; z-index:5; opacity:.7; pointer-events:none; }
-  /* z-index above the overlay (10) so the log stays readable — and un-blurred —
-     even while the settings menu is open. */
-  #debug { position:fixed; bottom:30px; left:10px; z-index:12; width:340px; max-height:42vh; overflow:auto;
+  /* z-index above the menu so the log stays readable while it's open. */
+  #debug { position:fixed; bottom:30px; left:10px; z-index:12; width:340px; max-width:calc(100vw - 20px); max-height:42vh; overflow:auto;
            background:rgba(8,8,12,.94); border:1px solid var(--line); border-radius:8px; padding:8px 10px;
            font:11px/1.45 ui-monospace, Menlo, Consolas, monospace; color:#cdd; display:none; }
   #debug.show { display:block; }
   #debug .ok { color:#6f6; } #debug .bad { color:#ff6b6b; } #debug .warn { color:#ffd479; } #debug .dim { color:#888; }
-  .hint { font-size:12px; color:var(--dim); margin-top:14px; line-height:1.5; }
+
+  /* ---- Layout edit mode: drag the stats / toolbar / log anywhere ---- */
+  body.editing #hud, body.editing #debug { display:block !important; }
+  body.editing #toolbar { display:flex !important; }
+  body.editing #hud, body.editing #toolbar, body.editing #debug {
+    outline:2px dashed var(--accent2); outline-offset:3px; cursor:move; pointer-events:auto; user-select:none; touch-action:none; }
+  body.editing #toolbar .ui { cursor:move; }
+  #editBar { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); z-index:30; display:none;
+             background:var(--panel); border:1px solid var(--accent); border-radius:14px; padding:14px 16px;
+             box-shadow:0 16px 50px rgba(0,0,0,.6); font-size:13px; gap:10px; align-items:center; flex-wrap:wrap;
+             max-width:90vw; justify-content:center; }
+  body.editing #editBar { display:flex; }
+
+  /* ---- Menu ---- */
+  /* Top-anchored (not centred) so the tab bar doesn't jump when tabs differ in height. */
+  #overlay { position:fixed; inset:0; z-index:10; display:flex; align-items:flex-start; justify-content:center;
+             background:rgba(0,0,0,.78); backdrop-filter:blur(4px); padding:max(16px, 6vh) 16px 16px; box-sizing:border-box; }
+  #overlay.hidden { display:none; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:16px; width:480px; max-width:100%;
+           max-height:100%; display:flex; flex-direction:column; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.55); }
+  .phead, .tabs, .pfoot { flex:none; }   /* never squash header/tabs/footer */
+  .phead { display:flex; align-items:center; gap:10px; padding:16px 18px 10px; }
+  .phead h1 { font-size:18px; margin:0; flex:1; }
+  .pill { font-size:11px; padding:3px 10px; border-radius:99px; background:#2a2a35; color:var(--dim); white-space:nowrap; }
+  .pill.on { background:rgba(34,197,94,.16); color:#4ade80; }
+  .tabs { display:flex; gap:2px; padding:0 12px; border-bottom:1px solid var(--line); overflow-x:auto; scrollbar-width:none; }
+  .tab { background:none; border:0; color:var(--dim); padding:10px 10px 9px; font-size:13px; cursor:pointer;
+         border-bottom:2px solid transparent; white-space:nowrap; }
+  .tab:hover { color:var(--txt); }
+  .tab.active { color:var(--txt); border-bottom-color:var(--accent); }
+  .pbody { padding:14px 16px 4px; overflow-y:auto; flex:1; min-height:0; }
+  .page { display:none; } .page.active { display:block; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin-bottom:12px; }
+  .card h3 { margin:0 0 8px; font-size:11px; text-transform:uppercase; letter-spacing:.07em; color:var(--dim); font-weight:600; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 0; }
+  .row + .row { border-top:1px solid rgba(255,255,255,.05); }
+  .lbl { font-size:13px; }
+  .lbl small { display:block; color:var(--dim); font-size:11px; margin-top:2px; }
+  .desc { font-size:11.5px; color:var(--dim); margin-top:7px; line-height:1.45; }
+  .val { font-size:12px; color:var(--dim); min-width:44px; text-align:right; display:inline-block; }
+  .ctl { display:flex; align-items:center; gap:6px; }
+  input[type=text] { width:100%; box-sizing:border-box; padding:10px 11px; border-radius:9px; border:1px solid var(--line);
+                     background:#0f0f14; color:var(--txt); font-size:14px; }
+  input[type=text]:focus { outline:none; border-color:var(--accent); }
+  input[type=range] { width:130px; accent-color:var(--accent); }
+  /* toggle switch */
+  input[type=checkbox].sw { appearance:none; -webkit-appearance:none; width:38px; height:22px; border-radius:99px;
+    background:#3a3a46; position:relative; cursor:pointer; flex:none; margin:0; transition:background .15s; }
+  input[type=checkbox].sw::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px;
+    border-radius:50%; background:#fff; transition:left .15s; }
+  input[type=checkbox].sw:checked { background:var(--accent); }
+  input[type=checkbox].sw:checked::after { left:19px; }
+  /* segmented control (built from a hidden <select data-seg>) */
+  select[data-seg] { display:none; }
+  .seg { display:flex; background:#0f0f14; border:1px solid var(--line); border-radius:9px; padding:3px; gap:3px; }
+  .seg button { flex:1; background:none; border:0; color:var(--dim); padding:7px 6px; border-radius:6px;
+                font-size:12px; cursor:pointer; white-space:nowrap; }
+  .seg button:hover { color:var(--txt); }
+  .seg button.active { background:var(--accent); color:#fff; }
+  .row .seg { flex:0 1 auto; }
+  /* on/off chips */
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin:4px 0 6px; }
+  .chip { font-size:12px; padding:6px 11px; border-radius:99px; border:1px solid var(--line); color:var(--dim);
+          cursor:pointer; user-select:none; background:#121218; }
+  .chip input { display:none; }
+  .chip:has(input:checked) { background:rgba(59,130,246,.18); border-color:var(--accent); color:var(--txt); }
+  /* corner picker */
+  .corners { display:grid; grid-template-columns:repeat(2, 30px); gap:4px; }
+  .corners button { width:30px; height:24px; border-radius:6px; border:1px solid var(--line); background:#121218;
+                    color:var(--dim); cursor:pointer; font-size:12px; padding:0; }
+  .corners button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  details.card > summary { cursor:pointer; font-size:11px; text-transform:uppercase; letter-spacing:.07em;
+                           color:var(--dim); font-weight:600; list-style:none; }
+  details.card > summary::before { content:"▸ "; } details.card[open] > summary::before { content:"▾ "; }
+  .pfoot { padding:12px 16px 14px; border-top:1px solid var(--line); display:flex; gap:8px; }
+  .btn { flex:1; padding:11px 14px; border:0; border-radius:10px; background:var(--accent); color:#fff;
+         font-size:14px; font-weight:600; cursor:pointer; }
+  .btn:hover { filter:brightness(1.1); }
+  .btn.sec { background:#2a2a35; color:var(--txt); font-weight:500; }
+  .btn.danger { background:#3b1d23; color:#ff9a9a; font-weight:500; flex:none; }
+  .btn.small { flex:none; padding:8px 12px; font-size:12.5px; font-weight:500; }
+  .btnrow { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+  kbd { background:#2a2a35; border-radius:4px; padding:1px 5px; font-size:11px; }
 </style>
 </head>
 <body>
@@ -82,6 +137,7 @@
     <button class="ui" id="btnFull">⛶ Fullscreen</button>
     <button class="ui" id="btnLock">🖱 Capture mouse</button>
     <button class="ui" id="btnLog">📋 Log</button>
+    <button class="ui" id="btnQuick">⚡ Quick test</button>
     <button class="ui" id="btnSpeed">📶 Speed test</button>
     <button class="ui" id="btnLeave">⏏ Leave</button>
   </div>
@@ -90,72 +146,147 @@
   <div id="debug"></div>
   <div id="status"></div>
 
+  <div id="editBar">
+    <span>Drag the <b>stats</b>, <b>toolbar</b> and <b>log</b> wherever you want them.</span>
+    <button class="btn sec small" id="editReset">Reset</button>
+    <button class="btn small" id="editDone">Done</button>
+  </div>
+
   <div id="overlay">
     <div class="panel">
-      <h1>Remote Desktop</h1>
-      <p class="sub" id="panelSub">Configure, then connect.</p>
-
-      <div class="grp" style="border-top:0; padding-top:0">
-        <h2>Connection</h2>
-        <label class="full" style="font-size:13px;color:#d6d6da">Host code <span style="color:var(--dim)">(or a wss:// URL)</span></label>
-        <input type="text" id="server" placeholder="your host's room code — e.g. frankfurt-pc" />
-        <div class="field" style="margin-top:10px"><label for="mode">Mode</label>
-          <select id="mode">
-            <option value="gpu">GPU H.264 — best</option>
-            <option value="webrtc">WebRTC — lowest latency</option>
-            <option value="wsvideo">JPEG — most compatible</option>
-          </select></div>
-        <div class="field"><label for="lanOn">Same WiFi as host (fastest)</label><input type="checkbox" id="lanOn"></div>
+      <div class="phead"><h1>Remote Desktop</h1><span class="pill" id="connPill">Not connected</span></div>
+      <div class="tabs">
+        <button class="tab active" data-tab="connect">Connect</button>
+        <button class="tab" data-tab="video">Video</button>
+        <button class="tab" data-tab="controls">Controls</button>
+        <button class="tab" data-tab="audio">Audio</button>
+        <button class="tab" data-tab="screen">Screen layout</button>
       </div>
 
-      <div class="grp">
-        <h2>Video</h2>
-        <div class="field"><label for="fps">Frame rate</label>
-          <input type="range" id="fps" min="10" max="60" step="5"><span class="val" id="fpsV"></span></div>
-        <div class="field"><label for="scale">Quality (resolution)</label>
-          <select id="scale">
-            <option value="1">100% (sharpest)</option>
-            <option value="0.75">75%</option>
-            <option value="0.5">50% (smoother)</option>
-            <option value="0.25">25% (lowest)</option>
-          </select></div>
-        <div class="field"><label for="fit">Fit to window</label>
-          <select id="fit">
-            <option value="contain">Keep aspect (letterbox)</option>
-            <option value="fill">Stretch to fill</option>
-          </select></div>
-        <div class="field"><label for="adaptive">Auto-adjust quality (reduce lag)</label><input type="checkbox" id="adaptive"></div>
-        <div class="field"><label for="audio">Enable audio (hear the PC)</label><input type="checkbox" id="audio"></div>
-        <div class="field"><label for="mic">Enable microphone (talk to the PC)</label><input type="checkbox" id="mic"></div>
-        <div style="font-size:11px;color:var(--dim);margin-top:2px">Mic plays into the PC's output — set the game's mic to <b>Stereo Mix</b>.</div>
+      <div class="pbody">
+        <!-- ===================== CONNECT ===================== -->
+        <div class="page active" data-page="connect">
+          <div class="card">
+            <h3>Host</h3>
+            <input type="text" id="server" placeholder="your room code — e.g. frankfurt-pc" autocomplete="off" />
+            <div class="desc">The room code shown in your host window (or a <b>wss://</b> address).</div>
+          </div>
+          <div class="card">
+            <h3>Mode</h3>
+            <select id="mode" data-seg>
+              <option value="gpu" data-short="GPU H.264" data-desc="Best for almost everything. Your graphics card encodes the video, so the PC stays fast, and it works on locked-down networks.">GPU H.264</option>
+              <option value="webrtc" data-short="WebRTC" data-desc="Lowest latency on the same WiFi or open networks. Blocked on some school/managed networks.">WebRTC</option>
+              <option value="wsvideo" data-short="JPEG" data-desc="Fallback for very old browsers. Uses the most data.">JPEG</option>
+            </select>
+            <div class="desc" id="modeDesc"></div>
+            <div class="row" style="margin-top:6px"><div class="lbl">Same WiFi as the host<small>Connect directly — fastest</small></div><input type="checkbox" class="sw" id="lanOn"></div>
+            <div class="row"><div class="lbl">Go fullscreen when connecting<small>Also when you press Resume</small></div><input type="checkbox" class="sw" id="autofs"></div>
+          </div>
+          <details class="card" id="diagCard">
+            <summary>Having trouble? Diagnostics</summary>
+            <div class="desc">Checks what your network lets through and reports it in the log.</div>
+            <div class="btnrow">
+              <button class="btn sec small" id="testBtn">🔍 Test what's blocked</button>
+              <button class="btn sec small" id="webrtcTestBtn">🔬 Test WebRTC</button>
+            </div>
+          </details>
+        </div>
+
+        <!-- ===================== VIDEO ===================== -->
+        <div class="page" data-page="video">
+          <div class="card">
+            <h3>Picture</h3>
+            <div class="row"><div class="lbl">Frame rate</div>
+              <div class="ctl"><input type="range" id="fps" min="10" max="60" step="5"><span class="val" id="fpsV"></span></div></div>
+            <div class="row"><div class="lbl">Resolution<small>Lower = smoother on slow connections</small></div>
+              <select id="scale" data-seg>
+                <option value="1" data-short="100%">100% (sharpest)</option>
+                <option value="0.75" data-short="75%">75%</option>
+                <option value="0.5" data-short="50%">50%</option>
+                <option value="0.25" data-short="25%">25% (lowest)</option>
+              </select></div>
+            <div class="row"><div class="lbl">Fit to window</div>
+              <select id="fit" data-seg>
+                <option value="contain" data-short="Keep shape">Keep aspect (letterbox)</option>
+                <option value="fill" data-short="Stretch">Stretch to fill</option>
+              </select></div>
+          </div>
+          <div class="card">
+            <h3>Smoothness</h3>
+            <div class="row"><div class="lbl">Auto-adjust quality<small>Lowers frame rate, then resolution, when lag starts to build</small></div><input type="checkbox" class="sw" id="adaptive"></div>
+          </div>
+        </div>
+
+        <!-- ===================== CONTROLS ===================== -->
+        <div class="page" data-page="controls">
+          <div class="card">
+            <h3>Mouse</h3>
+            <div class="row"><div class="lbl">Capture mouse on click<small>For games — the camera keeps turning past the screen edge</small></div><input type="checkbox" class="sw" id="lock"></div>
+            <div class="row"><div class="lbl">Sensitivity</div>
+              <div class="ctl"><input type="range" id="sens" min="0.2" max="3" step="0.1"><span class="val" id="sensV"></span></div></div>
+            <div class="row"><div class="lbl">Smooth movement</div><input type="checkbox" class="sw" id="smooth"></div>
+          </div>
+          <div class="card">
+            <h3>Cursor</h3>
+            <div class="row"><div class="lbl">Show the PC's cursor</div><input type="checkbox" class="sw" id="cursor"></div>
+            <div class="row"><div class="lbl">Hide it when a game grabs the mouse<small>Stops a cursor floating over 3D games</small></div><input type="checkbox" class="sw" id="cursorhide"></div>
+          </div>
+          <div class="card">
+            <h3>Keyboard</h3>
+            <div class="row"><div class="lbl">Game input mode<small>Sends hardware keys — use it if a game ignores your keyboard</small></div><input type="checkbox" class="sw" id="gameinput"></div>
+            <div class="desc">While the mouse is captured, press <kbd>\</kbd> to send <kbd>Esc</kbd> to the game. Press <kbd>Esc</kbd> to let go of the mouse, and again to open this menu.</div>
+          </div>
+        </div>
+
+        <!-- ===================== AUDIO ===================== -->
+        <div class="page" data-page="audio">
+          <div class="card">
+            <h3>Sound</h3>
+            <div class="row"><div class="lbl">Hear the PC</div><input type="checkbox" class="sw" id="audio"></div>
+            <div class="row"><div class="lbl">Use my microphone<small>So voice chat in games works</small></div><input type="checkbox" class="sw" id="mic"></div>
+            <div class="desc">Your mic plays out of the PC — set the game's microphone to <b>Stereo Mix</b>, or to <b>CABLE Output</b> if you've installed VB-CABLE.</div>
+          </div>
+        </div>
+
+        <!-- ===================== SCREEN LAYOUT ===================== -->
+        <div class="page" data-page="screen">
+          <div class="card">
+            <h3>Stats</h3>
+            <div class="row"><div class="lbl">Show stats</div><input type="checkbox" class="sw" id="hudOn"></div>
+            <div class="chips" id="hudItems"></div>
+            <div class="row"><div class="lbl">Size</div><div class="ctl"><input type="range" id="hudSize" min="9" max="20" step="1"><span class="val" id="hudSizeV"></span></div></div>
+            <div class="row"><div class="lbl">Opacity</div><div class="ctl"><input type="range" id="hudOpacity" min="0.2" max="1" step="0.05"><span class="val" id="hudOpacityV"></span></div></div>
+            <div class="row"><div class="lbl">Corner</div><div class="corners" data-target="hud"></div></div>
+          </div>
+          <div class="card">
+            <h3>Toolbar</h3>
+            <div class="row"><div class="lbl">Show toolbar</div><input type="checkbox" class="sw" id="toolbarOn"></div>
+            <div class="chips" id="tbItems"></div>
+            <div class="row"><div class="lbl">Size</div><div class="ctl"><input type="range" id="tbSize" min="10" max="18" step="1"><span class="val" id="tbSizeV"></span></div></div>
+            <div class="row"><div class="lbl">Opacity</div><div class="ctl"><input type="range" id="tbOpacity" min="0.2" max="1" step="0.05"><span class="val" id="tbOpacityV"></span></div></div>
+            <div class="row"><div class="lbl">Corner</div><div class="corners" data-target="toolbar"></div></div>
+          </div>
+          <div class="card">
+            <h3>Connection log</h3>
+            <div class="row"><div class="lbl">Keep it open after connecting<small>Otherwise it shows while connecting and hides once you're in</small></div><input type="checkbox" class="sw" id="keepLog"></div>
+            <div class="row"><div class="lbl">Corner</div><div class="corners" data-target="debug"></div></div>
+          </div>
+          <div class="card">
+            <h3>Move things freely</h3>
+            <div class="desc" style="margin-top:0">Drag the stats, toolbar and log to any spot on the screen.</div>
+            <div class="btnrow">
+              <button class="btn small" id="editLayoutBtn">✥ Drag things into place</button>
+              <button class="btn sec small" id="resetLayoutBtn">Reset layout</button>
+            </div>
+          </div>
+        </div>
       </div>
 
-      <div class="grp">
-        <h2>Mouse &amp; keyboard</h2>
-        <div class="field"><label for="lock">Capture mouse on click (gaming)</label><input type="checkbox" id="lock"></div>
-        <div class="field"><label for="gameinput">Game input mode (scancodes — fixes HL2 etc.)</label><input type="checkbox" id="gameinput"></div>
-        <div style="font-size:11px;color:var(--dim);margin:-4px 0 6px">While mouse is captured, press <b>\</b> (backslash) to send <b>Esc</b> to the game.</div>
-        <div class="field"><label for="sens">Sensitivity</label>
-          <input type="range" id="sens" min="0.2" max="3" step="0.1"><span class="val" id="sensV"></span></div>
-        <div class="field"><label for="smooth">Smooth movement</label><input type="checkbox" id="smooth"></div>
-        <div class="field"><label for="cursor">Show cursor on screen</label><input type="checkbox" id="cursor"></div>
-        <div class="field"><label for="cursorhide">Hide cursor when a game grabs it (3D)</label><input type="checkbox" id="cursorhide"></div>
+      <div class="pfoot">
+        <button class="btn" id="connectBtn">Connect</button>
+        <button class="btn" id="doneBtn" style="display:none">Resume</button>
+        <button class="btn danger" id="leaveBtn2" style="display:none">Disconnect</button>
       </div>
-
-      <div class="grp">
-        <h2>Overlay</h2>
-        <div class="field"><label for="hudOn">Show stats (top-right)</label><input type="checkbox" id="hudOn"></div>
-        <div id="hudItems" style="margin:-4px 0 6px 14px;padding-left:10px;border-left:2px solid var(--line)"></div>
-        <div class="field"><label for="toolbarOn">Show toolbar buttons (top-left)</label><input type="checkbox" id="toolbarOn"></div>
-        <div class="field"><label for="logOn">Show connection log (bottom-left)</label><input type="checkbox" id="logOn"></div>
-        <div style="font-size:11px;color:var(--dim);margin-top:4px">Tip: with the toolbar hidden, press <b>Esc</b> to reopen this menu.</div>
-      </div>
-
-      <button class="btn" id="connectBtn">Connect</button>
-      <button class="btn sec" id="testBtn">🔍 Test what's blocked</button>
-      <button class="btn sec" id="webrtcTestBtn">🔬 Test WebRTC (see how it's blocked)</button>
-      <button class="btn sec" id="doneBtn" style="display:none">Resume</button>
-      <div class="hint" id="hint">After connecting, click the screen (or “Capture mouse”) to play games with Pointer Lock. Press <b>Esc</b> to release and reopen this panel.</div>
     </div>
   </div>
 
@@ -194,6 +325,7 @@ const DEFAULTS = {
   fps: 30, scale: 1, fit: "contain",
   lock: true, sens: 1, smooth: true, cursor: true, hud: true, toolbar: true, log: true, relay: false,
   mode: "gpu", quality: 55, gameinput: false, adaptive: true, audio: false, mic: false, lan: false, cursorhide: false, hudItems: {},
+  autofs: true, keepLog: false, hudSize: 12, hudOpacity: 1, tbSize: 13, tbOpacity: 1, tbItems: {}, layout: {},
 };
 let S = Object.assign({}, DEFAULTS, JSON.parse(localStorage.getItem("rd-settings") || "{}"));
 // URL overrides
@@ -217,8 +349,139 @@ const HUD_ITEMS = [
   ["mydown",  "Your down",  "Your download speed"],
 ];
 const hudOn = (k) => (S.hudItems || {})[k] !== false;   // everything on by default
-$("hudItems").innerHTML = HUD_ITEMS.map(([k, , long]) =>
-  `<div class="field" style="margin:5px 0"><label for="hud_${k}" style="font-size:12px">${long}</label><input type="checkbox" id="hud_${k}"></div>`).join("");
+const chip = (id, label) => `<label class="chip"><input type="checkbox" id="${id}">${label}</label>`;
+$("hudItems").innerHTML = HUD_ITEMS.map(([k, , long]) => chip("hud_" + k, long)).join("");
+// Toolbar buttons that can be shown/hidden.
+const TB_ITEMS = [["btnSettings", "Settings"], ["btnFull", "Fullscreen"], ["btnLock", "Capture mouse"],
+                  ["btnLog", "Log"], ["btnQuick", "Quick test"], ["btnSpeed", "Speed test"], ["btnLeave", "Leave"]];
+const tbOn = (id) => (S.tbItems || {})[id] !== false;
+$("tbItems").innerHTML = TB_ITEMS.map(([id, label]) => chip("tb_" + id, label)).join("");
+
+// Segmented buttons, built from each hidden <select data-seg> so the rest of the
+// code can keep reading select.value.
+document.querySelectorAll("select[data-seg]").forEach((sel) => {
+  const seg = document.createElement("div");
+  seg.className = "seg"; seg.dataset.for = sel.id;
+  for (const o of sel.options) {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.textContent = o.dataset.short || o.text; btn.title = o.text; btn.dataset.v = o.value;
+    btn.onclick = () => { sel.value = o.value; refreshSegs(); };
+    seg.appendChild(btn);
+  }
+  sel.after(seg);
+});
+function refreshSegs() {
+  document.querySelectorAll(".seg[data-for]").forEach((seg) => {
+    const v = $(seg.dataset.for).value;
+    seg.querySelectorAll("button").forEach((btn) => btn.classList.toggle("active", btn.dataset.v === v));
+  });
+  const o = $("mode").selectedOptions[0];
+  $("modeDesc").textContent = o ? o.dataset.desc || "" : "";
+}
+
+// Tabs.
+document.querySelectorAll(".tab").forEach((t) => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x === t));
+  document.querySelectorAll(".page").forEach((pg) => pg.classList.toggle("active", pg.dataset.page === t.dataset.tab));
+});
+
+// ---- Screen layout: where the stats / toolbar / log sit, and how they look --
+// Each piece is pinned to its nearest corner with a pixel offset, so it stays
+// put when the window is resized.
+const MOVABLE = { hud: () => hud, toolbar: () => $("toolbar"), debug: () => debugEl };
+const DEF_LAYOUT = { hud: { h: "right", v: "top", dx: 10, dy: 10 },
+                     toolbar: { h: "left", v: "top", dx: 10, dy: 10 },
+                     debug: { h: "left", v: "bottom", dx: 10, dy: 30 } };
+const posOf = (k) => Object.assign({}, DEF_LAYOUT[k], (S.layout || {})[k]);
+function placeEl(k) {
+  const el = MOVABLE[k](), p = posOf(k);
+  el.style.left = p.h === "left" ? p.dx + "px" : "auto";
+  el.style.right = p.h === "right" ? p.dx + "px" : "auto";
+  el.style.top = p.v === "top" ? p.dy + "px" : "auto";
+  el.style.bottom = p.v === "bottom" ? p.dy + "px" : "auto";
+}
+function applyLayout() {
+  for (const k in MOVABLE) placeEl(k);
+  hud.style.fontSize = S.hudSize + "px";
+  hud.style.opacity = S.hudOpacity;
+  const tb = $("toolbar");
+  tb.style.opacity = S.tbOpacity;
+  tb.querySelectorAll(".ui").forEach((btn) => btn.style.fontSize = S.tbSize + "px");
+  for (const [id] of TB_ITEMS) $(id).style.display = tbOn(id) ? "" : "none";
+  document.querySelectorAll(".corners").forEach((c) => {
+    const p = posOf(c.dataset.target);
+    c.querySelectorAll("button").forEach((btn) =>
+      btn.classList.toggle("active", btn.dataset.h === p.h && btn.dataset.v === p.v));
+  });
+}
+document.querySelectorAll(".corners").forEach((c) => {
+  for (const [h, v, sym] of [["left", "top", "↖"], ["right", "top", "↗"], ["left", "bottom", "↙"], ["right", "bottom", "↘"]]) {
+    const btn = document.createElement("button");
+    btn.type = "button"; btn.textContent = sym; btn.dataset.h = h; btn.dataset.v = v;
+    btn.onclick = () => {
+      const k = c.dataset.target;
+      S.layout = S.layout || {};
+      S.layout[k] = { h, v, dx: 10, dy: k === "debug" && v === "bottom" ? 30 : 10 };
+      saveSettings(); applyLayout();
+    };
+    c.appendChild(btn);
+  }
+});
+// Sliders preview live.
+for (const [id, key, fmt] of [["hudSize", "hudSize", (v) => v + "px"], ["hudOpacity", "hudOpacity", (v) => Math.round(v * 100) + "%"],
+                              ["tbSize", "tbSize", (v) => v + "px"], ["tbOpacity", "tbOpacity", (v) => Math.round(v * 100) + "%"]]) {
+  $(id).addEventListener("input", () => { S[key] = +$(id).value; $(id + "V").textContent = fmt(S[key]); applyLayout(); });
+}
+
+// Drag mode.
+let drag = null;
+for (const k in MOVABLE) {
+  MOVABLE[k]().addEventListener("pointerdown", (e) => {
+    if (!document.body.classList.contains("editing")) return;
+    e.preventDefault();
+    const r = MOVABLE[k]().getBoundingClientRect();
+    drag = { k, ox: e.clientX - r.left, oy: e.clientY - r.top };
+  });
+}
+document.addEventListener("pointermove", (e) => {
+  if (!drag) return;
+  const el = MOVABLE[drag.k](), r = el.getBoundingClientRect();
+  const x = Math.min(Math.max(0, e.clientX - drag.ox), innerWidth - r.width);
+  const y = Math.min(Math.max(0, e.clientY - drag.oy), innerHeight - r.height);
+  Object.assign(el.style, { left: x + "px", top: y + "px", right: "auto", bottom: "auto" });
+});
+document.addEventListener("pointerup", () => {
+  if (!drag) return;
+  const r = MOVABLE[drag.k]().getBoundingClientRect();
+  const h = r.left + r.width / 2 < innerWidth / 2 ? "left" : "right";
+  const v = r.top + r.height / 2 < innerHeight / 2 ? "top" : "bottom";
+  S.layout = S.layout || {};
+  S.layout[drag.k] = { h, v, dx: Math.round(h === "left" ? r.left : innerWidth - r.right),
+                       dy: Math.round(v === "top" ? r.top : innerHeight - r.bottom) };
+  drag = null;
+  saveSettings(); applyLayout();
+});
+// In drag mode, clicking toolbar buttons must not trigger them.
+$("toolbar").addEventListener("click", (e) => {
+  if (document.body.classList.contains("editing")) { e.stopPropagation(); e.preventDefault(); }
+}, true);
+function enterEdit() {
+  formToS(); saveSettings(); applyLayout();
+  overlay.classList.add("hidden");           // settingsOpen stays true, so no input reaches the PC
+  document.body.classList.add("editing");
+  if (!hud.textContent.trim()) hud.innerHTML = "Stats <b>preview</b><br>FPS <b>60</b><br>Ping <b>40 ms</b>";
+  if (!debugEl.textContent.trim()) dbg("Connection log (preview)", "dim");
+}
+function exitEdit() {
+  document.body.classList.remove("editing");
+  saveSettings();
+  openSettings();
+}
+function resetLayout() { S.layout = {}; saveSettings(); applyLayout(); }
+$("editLayoutBtn").onclick = enterEdit;
+$("editDone").onclick = exitEdit;
+$("editReset").onclick = resetLayout;
+$("resetLayoutBtn").onclick = resetLayout;
 function saveSettings() { localStorage.setItem("rd-settings", JSON.stringify(S)); }
 
 // Bind form <-> S
@@ -226,22 +489,32 @@ function formToS() {
   S.server = $("server").value.trim();
   S.fps = +$("fps").value; S.scale = +$("scale").value; S.fit = $("fit").value;
   S.lock = $("lock").checked; S.sens = +$("sens").value; S.smooth = $("smooth").checked;
-  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.log = $("logOn").checked;
+  S.cursor = $("cursor").checked; S.hud = $("hudOn").checked; S.toolbar = $("toolbarOn").checked; S.keepLog = $("keepLog").checked;
+  S.autofs = $("autofs").checked;
+  S.hudSize = +$("hudSize").value; S.hudOpacity = +$("hudOpacity").value; S.tbSize = +$("tbSize").value; S.tbOpacity = +$("tbOpacity").value;
   S.mode = $("mode").value;
   S.gameinput = $("gameinput").checked; S.adaptive = $("adaptive").checked; S.audio = $("audio").checked; S.mic = $("mic").checked;
   S.lan = $("lanOn").checked; S.cursorhide = $("cursorhide").checked;
   S.hudItems = {}; for (const [k] of HUD_ITEMS) S.hudItems[k] = $("hud_" + k).checked;
+  S.tbItems = {}; for (const [id] of TB_ITEMS) S.tbItems[id] = $("tb_" + id).checked;
 }
 function sToForm() {
   $("server").value = S.server;
   $("fps").value = S.fps; $("fpsV").textContent = S.fps + " fps";
   $("scale").value = String(S.scale); $("fit").value = S.fit;
   $("lock").checked = S.lock; $("sens").value = S.sens; $("sensV").textContent = S.sens.toFixed(1) + "×";
-  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("logOn").checked = S.log;
+  $("smooth").checked = S.smooth; $("cursor").checked = S.cursor; $("hudOn").checked = S.hud; $("toolbarOn").checked = S.toolbar; $("keepLog").checked = S.keepLog;
+  $("autofs").checked = S.autofs;
+  for (const [id, key, fmt] of [["hudSize", "hudSize", (v) => v + "px"], ["hudOpacity", "hudOpacity", (v) => Math.round(v * 100) + "%"],
+                                ["tbSize", "tbSize", (v) => v + "px"], ["tbOpacity", "tbOpacity", (v) => Math.round(v * 100) + "%"]]) {
+    $(id).value = S[key]; $(id + "V").textContent = fmt(S[key]);
+  }
   $("mode").value = S.mode;
   $("gameinput").checked = S.gameinput; $("adaptive").checked = S.adaptive; $("audio").checked = S.audio; $("mic").checked = S.mic;
   $("lanOn").checked = S.lan; $("cursorhide").checked = S.cursorhide;
   for (const [k] of HUD_ITEMS) $("hud_" + k).checked = hudOn(k);
+  for (const [id] of TB_ITEMS) $("tb_" + id).checked = tbOn(id);
+  refreshSegs();
 }
 $("fps").addEventListener("input", () => $("fpsV").textContent = $("fps").value + " fps");
 $("sens").addEventListener("input", () => $("sensV").textContent = (+$("sens").value).toFixed(1) + "×");
@@ -262,6 +535,7 @@ function scheduleReconnect() {
   if (reconnectTimer) return;
   setStatus("⚠ connection lost — reconnecting…");
   dbg("Connection lost — auto-reconnecting in 2s…", "warn");
+  debugEl.classList.add("show");
   if (pc) { try { pc.close(); } catch {} pc = null; }
   inputChannel = null; connected = false;
   if (ws) { try { ws.close(); } catch {} ws = null; }
@@ -294,12 +568,15 @@ function updateCursorHide() {
 function openSettings() {
   settingsOpen = true;
   if (document.pointerLockElement) document.exitPointerLock();
-  $("connectBtn").style.display = connected ? "none" : "block";
-  $("testBtn").style.display = connected ? "none" : "block";
-  $("webrtcTestBtn").style.display = connected ? "none" : "block";
-  $("doneBtn").style.display = connected ? "block" : "none";
-  $("panelSub").textContent = connected ? "Adjust settings live." : "Configure, then connect.";
+  $("connectBtn").style.display = connected ? "none" : "";
+  $("doneBtn").style.display = connected ? "" : "none";
+  $("leaveBtn2").style.display = connected || wantConnected ? "" : "none";
+  $("diagCard").style.display = connected ? "none" : "";
+  const pill = $("connPill");
+  pill.textContent = connected ? "Connected" : wantConnected ? "Connecting…" : "Not connected";
+  pill.classList.toggle("on", connected);
   sToForm();
+  applyLayout();
   overlay.classList.remove("hidden");
   updateCursorHide();
 }
@@ -307,28 +584,41 @@ function closeSettings() {
   formToS(); saveSettings();
   curFps = S.fps; curScale = S.scale;   // user changed settings → reset adaptive baseline
   applyVideoStyle();
+  applyLayout();
   sendConfig();
   hud.style.display = S.hud ? "block" : "none";
   document.body.classList.toggle("hidetoolbar", !S.toolbar);
-  debugEl.classList.toggle("show", S.log);
+  if (connected) debugEl.classList.toggle("show", S.keepLog);
   overlay.classList.add("hidden");
   settingsOpen = false;
   updateCursorHide();
 }
+// Fullscreen is only allowed from a click, so it's requested right in the
+// Connect / Resume button handlers.
+function goFullscreen() {
+  if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(() => {});
+}
+// The log shows while connecting and hides shortly after the picture appears
+// (unless "Keep it open" is on). It reappears if the connection drops.
+function onLive() { setTimeout(() => { if (connected && !S.keepLog) debugEl.classList.remove("show"); }, 1500); }
 
 $("btnSettings").onclick = openSettings;
-$("doneBtn").onclick = closeSettings;
-$("connectBtn").onclick = () => { formToS(); saveSettings(); connect(); };
+$("doneBtn").onclick = () => { if ($("autofs").checked) goFullscreen(); closeSettings(); };
+$("connectBtn").onclick = () => { formToS(); saveSettings(); if (S.autofs) goFullscreen(); connect(); };
+$("leaveBtn2").onclick = () => leave();
 $("testBtn").onclick = () => { formToS(); saveSettings(); networkTest(); };
 $("webrtcTestBtn").onclick = () => { formToS(); saveSettings(); testWebRTC(); };
 
 // Runs a REAL WebRTC handshake with the host and reports exactly which layer
 // fails, so you can see whether it's ICE (needs a relay) or DTLS media (a
 // filter) — and understand why a different signaling URL won't change it.
-function testWebRTC() {
+async function testWebRTC() {
   debugEl.innerHTML = ""; debugEl.classList.add("show");
   dbg("=== WebRTC BLOCK TEST (host must be running) ===");
-  const tws = new WebSocket(S.server); tws.binaryType = "arraybuffer";
+  const url = await resolveServer(S.server);
+  if (!url) { dbg("Host not found for that code — is it running?", "bad"); return; }
+  const room = /^wss?:\/\//i.test((S.server || "").trim()) ? "default" : S.server.trim().toLowerCase();
+  const tws = new WebSocket(url); tws.binaryType = "arraybuffer";
   let tpc = null, ice = "-", peer = "-", done = false;
   const finish = () => {
     if (done) return; done = true;
@@ -347,7 +637,7 @@ function testWebRTC() {
     try { tpc && tpc.close(); } catch {}
     try { tws.close(); } catch {}
   };
-  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room: S.room })); };
+  tws.onopen = () => { dbg("Signaling: connected ✓", "ok"); tws.send(JSON.stringify({ type: "register", role: "viewer", room })); };
   tws.onerror = () => { dbg("Signaling: BLOCKED ✗", "bad"); finish(); };
   tws.onmessage = async (ev) => {
     if (ev.data instanceof ArrayBuffer) return;
@@ -366,10 +656,11 @@ function testWebRTC() {
   setTimeout(finish, 15000);
 }
 $("btnFull").onclick = toggleFullscreen;
-$("btnLock").onclick = () => { if (!locked()) video.requestPointerLock(); };
-$("btnLog").onclick = () => { S.log = !debugEl.classList.contains("show"); debugEl.classList.toggle("show", S.log); saveSettings(); };
+$("btnLock").onclick = () => { if (!locked()) displayEl().requestPointerLock(); };
+$("btnLog").onclick = () => debugEl.classList.toggle("show");
 $("btnLeave").onclick = leave;
 $("btnSpeed").onclick = runSpeedTest;
+$("btnQuick").onclick = runQuickTest;
 
 // ---- Speed test -----------------------------------------------------------
 // 1) PC -> you: the host streams junk down the real connection for ~4s, paced
@@ -385,6 +676,18 @@ function runSpeedTest() {
   stBytes = 0; stFirst = 0; stLast = 0;
   dbg("Speed test: measuring PC → you …");
   wsSend({ type: "speedtest" });
+  pollStats();
+}
+// Quick test: just your download and the PC's upload, run side by side (~6s).
+async function runQuickTest() {
+  if (!ws || ws.readyState !== 1 || speed.hostUpRunning || speed.myDownRunning) return;
+  Object.assign(speed, { hostUp: null, myDown: null, hostUpRunning: true, myDownRunning: true });
+  dbg("Quick test: your download + the PC's upload …");
+  wsSend({ type: "upload-test" });
+  pollStats();
+  speed.myDown = await myDownloadMbps();
+  speed.myDownRunning = false;
+  dbg("Quick test: your download = " + fmtMbps(speed.myDown), "ok");
   pollStats();
 }
 function onSpeedChunk(len) {
@@ -468,9 +771,10 @@ async function networkTest() {
   dbg("=== NETWORK TEST ===");
 
   // 1. Signaling reachability (TLS/WebSocket on 443).
-  const wsOk = await new Promise((res) => {
+  const testUrl = await resolveServer(S.server);
+  const wsOk = !testUrl ? false : await new Promise((res) => {
     let done = false;
-    const t = new WebSocket(S.server);
+    const t = new WebSocket(testUrl);
     const finish = (ok) => { if (!done) { done = true; try { t.close(); } catch {} res(ok); } };
     t.onopen = () => finish(true);
     t.onerror = () => finish(false);
@@ -552,7 +856,7 @@ async function connect() {
   curFps = S.fps; curScale = S.scale; mediaPing = null;
   lagHist = []; baseLag = curLag = null;
   if (S.audio && isWs()) setupAudio();   // create AudioContext in the click gesture
-  debugEl.innerHTML = ""; debugEl.classList.toggle("show", S.log);
+  debugEl.innerHTML = ""; debugEl.classList.add("show");   // visible while connecting
   gotFirstFrame = false; candCounts = { host: 0, srflx: 0, relay: 0 };
   connectedAt = 0; noFrameWarned = false;
   setStatus("connecting…");
@@ -670,6 +974,7 @@ function drawVideoFrame(frame) {
     document.body.classList.add("streaming");
     applyVideoStyle();
     dbg("First H.264 frame decoded ✓ — GPU video is LIVE 🎉", "ok");
+    onLive();
     closeSettings();
     setStatus("");
   }
@@ -781,7 +1086,7 @@ function lagStats(st) {
 // Draw the overlay from a {key: value} object, showing only the enabled lines.
 function renderHud(st) {
   if (!S.hud) return;
-  const show = (running, v) => running ? "testing…" : (v === null ? null : fmtMbps(v));
+  const show = (running, v) => running ? "testing…" : fmtMbps(v);   // "–" until you run a test
   st.pathmax = show(speed.pathRunning, speed.path);
   st.hostup  = show(speed.hostUpRunning, speed.hostUp);
   st.mydown  = show(speed.myDownRunning, speed.myDown);
@@ -817,6 +1122,7 @@ async function renderFrame(buf) {
       document.body.classList.add("streaming");
       applyVideoStyle();
       dbg("First frame received ✓ — WebSocket video is LIVE 🎉", "ok");
+      onLive();
       closeSettings();
       setStatus("");
     }
@@ -1041,7 +1347,7 @@ async function pollStats() {
     if (bytes > 0 && !gotFirstFrame) {
       gotFirstFrame = true;
       dbg("First video data arriving ✓ — IT WORKS", "ok");
-      setTimeout(() => debugEl.classList.remove("show"), 4000);
+      onLive();
     }
     if (!gotFirstFrame && Date.now() - connectedAt > 8000 && !noFrameWarned) {
       noFrameWarned = true;
@@ -1074,6 +1380,7 @@ async function pollStats() {
 setInterval(pollStats, 1000);
 
 // ---- Boot -----------------------------------------------------------------
+applyLayout();
 openSettings();
 if (qs.get("autoconnect") === "1") { formToS(); saveSettings(); connect(); }
 </script>

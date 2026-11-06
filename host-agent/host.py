@@ -987,6 +987,14 @@ async def connect_once():
             elif mtype == "st-ack":
                 st_state["acked"] = int(msg.get("n", 0))
 
+            elif mtype == "upload-test":
+                # Quick test: only this PC's upload to Cloudflare (no path test).
+                async def _upload_test():
+                    up = await asyncio.get_event_loop().run_in_executor(None, host_upload_mbps)
+                    print(f"quick test: PC upload = {up and round(up, 1)} Mbps")
+                    await ws.send(json.dumps({"type": "host-up", "mbps": up}))
+                asyncio.create_task(_upload_test())
+
             elif mtype == "ack":
                 stream_state["acked"] = int(msg.get("n", 0))
 
